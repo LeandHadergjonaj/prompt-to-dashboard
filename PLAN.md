@@ -355,3 +355,360 @@ WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dashboard_reader') \gexec
 ALTER ROLE dashboard_reader SET default_transaction_read_only = on;
 ALTER ROLE dashboard_reader SET statement_timeout = '20s';
 
+-- pagila-schema.sql grants ALL (incl. CREATE) on schema public to PUBLIC; close that hole.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO dashboard_reader;
+
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO dashboard_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO dashboard_reader;
+
+-- Belt-and-suspenders
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+  ON ALL TABLES IN SCHEMA public FROM dashboard_reader;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM dashboard_reader;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM dashboard_reader;
+REVOKE CREATE ON SCHEMA public FROM dashboard_reader;
+```
+
+Security model to keep straight: the role-level GUCs (`default_transaction_read_only`, `statement_timeout`) are session *defaults*, not hard boundaries — the unbypassable boundary is the GRANT/REVOKE set (no write privilege exists on anything). The app adds two more layers (sqlGuard + single-statement read-only transactions), so a client can never issue the `SET` that would lift the defaults anyway.
+
+### scripts/04_verify.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DATABASE_URL:?export DATABASE_URL first}"
+: "${DATABASE_URL_READONLY:?export DATABASE_URL_READONLY first}"
+
+echo "== Database size (must be > 1 GB) =="
+psql "$DATABASE_URL" -c "SELECT pg_size_pretty(pg_database_size(current_database()));"
+
+echo "== Row counts =="
+psql "$DATABASE_URL" -c "
+  SELECT 'customer'  t, count(*) FROM customer
+  UNION ALL SELECT 'inventory', count(*) FROM inventory
+  UNION ALL SELECT 'rental',    count(*) FROM rental
+  UNION ALL SELECT 'payment',   count(*) FROM payment
+  UNION ALL SELECT 'film',      count(*) FROM film
+  ORDER BY 1;
+"
+
+echo "== Date ranges =="
+psql "$DATABASE_URL" -c "SELECT min(rental_date), max(rental_date) FROM rental;"
+psql "$DATABASE_URL" -c "SELECT min(payment_date), max(payment_date) FROM payment;"
+
+fail=0
+check_fails() {
+  local label="$1"
+  local sql="$2"
+  # "permission denied" (DML/CREATE), "must be owner" (DROP), "read-only transaction" all count as correctly blocked
+  if psql "$DATABASE_URL_READONLY" -c "$sql" 2>&1 | grep -qiE "permission denied|must be owner|read-only transaction"; then
+    echo "PASS: $label correctly rejected"
+  else
+    echo "FAIL: $label was NOT rejected"
+    fail=1
+  fi
+}
+
+echo "== dashboard_reader negative checks (each MUST fail) =="
+check_fails "INSERT"       "INSERT INTO customer (store_id, first_name, last_name, address_id) VALUES (1,'x','y',1);"
+check_fails "UPDATE"       "UPDATE customer SET first_name = 'x' WHERE customer_id = 1;"
+check_fails "DELETE"       "DELETE FROM customer WHERE customer_id = 1;"
+check_fails "CREATE TABLE" "CREATE TABLE t_should_fail (id int);"
+check_fails "DROP TABLE"   "DROP TABLE film;"
+
+echo "== dashboard_reader positive check (MUST succeed) =="
+psql "$DATABASE_URL_READONLY" -c "SELECT count(*) FROM film;"
+
+exit $fail
+```
+
+**Stage 2 gate:** all five negative checks PASS, positive check succeeds.
+
+---
+
+# Stage 3 — App scaffold
+
+```bash
+npx create-next-app@15 . --typescript --tailwind --eslint --app --import-alias "@/*" --use-npm
+```
+
+- Must be `create-next-app@15` (resolves to 15.5.x) — plain `@latest` now scaffolds Next 16. [verified]
+- The repo contains only `README.md` + `.git`. [unverified — executor must check] if create-next-app refuses the non-empty dir: scaffold into a temp folder and move everything except `.git`/`README.md` into the repo root.
+- It scaffolds **Tailwind v4** (no tailwind.config; `@import "tailwindcss"` in globals.css). This spec needs no theme edits — all custom colors use arbitrary values (`bg-[#2a78d6]`).
+
+Then:
+
+```bash
+npm install pg@^8.16 zod@^3.25 openai@^5 recharts@3.9.2
+npm install -D @types/pg
+```
+
+- **recharts is pinned to `3.9.2` exactly** — a deliberate deviation from the original `2.15.4` idea: the 2.x line is dead (last release 2025-06; the repo explicitly says v2 receives no updates). Every chart composition in Stage 7 was written against the v3 API and uses nothing from v3's removed-props list. [verified against npm registry + recharts 3.0 migration guide]
+- zod stays on v3: the OpenAI SDK's `zodTextFormat` helper is incompatible with zod v4. [verified]
+- Create `.env.local` with `DATABASE_URL_READONLY` and `OPENAI_API_KEY` from Stage 0 (scaffolded `.gitignore` already excludes `.env*`). Add `db/vendor/` to `.gitignore` (re-downloadable). `db/schema-context.md` (Stage 4) **must be committed** — routes read it at runtime.
+- In `app/layout.tsx`, delete the scaffolded Geist `next/font` import — the app uses the system font stack (Stage 7).
+
+**Stage 3 gate:** `npm run dev` serves the default page on localhost:3000.
+
+---
+
+# Stage 4 — Schema context: `scripts/introspect-schema.mjs`
+
+Plain Node + `pg` (installed by Stage 3), connects with the **admin** URL, writes `db/schema-context.md`. Run: `DATABASE_URL="$DATABASE_URL" node scripts/introspect-schema.mjs`
+
+```js
+#!/usr/bin/env node
+import { Client } from 'pg';
+import { writeFileSync } from 'node:fs';
+
+const client = new Client({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+const LOW_CARDINALITY = [
+  { table: 'film', column: 'rating' },
+  { table: 'category', column: 'name' },
+  { table: 'language', column: 'name' },
+  { table: 'customer', column: 'active' },
+];
+
+async function main() {
+  await client.connect();
+
+  const { rows: tables } = await client.query(
+    `SELECT table_name FROM information_schema.tables
+     WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+     ORDER BY table_name;`
+  );
+
+  let md = `# Schema Context\n\nGenerated: ${new Date().toISOString()}\n\n## Tables\n\n`;
+
+  for (const { table_name } of tables) {
+    const cols = await client.query(
+      `SELECT column_name, data_type, is_nullable, column_default
+       FROM information_schema.columns
+       WHERE table_schema='public' AND table_name=$1
+       ORDER BY ordinal_position;`, [table_name]
+    );
+    const pk = await client.query(
+      `SELECT kcu.column_name FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+       WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='public' AND tc.table_name=$1
+       ORDER BY kcu.ordinal_position;`, [table_name]
+    );
+    const fks = await client.query(
+      `SELECT kcu.column_name AS fk_column, ccu.table_name AS ref_table, ccu.column_name AS ref_column
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+       JOIN information_schema.constraint_column_usage ccu
+         ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
+       WHERE tc.constraint_type='FOREIGN KEY' AND tc.table_schema='public' AND tc.table_name=$1;`, [table_name]
+    );
+
+    let approx;
+    if (table_name === 'payment') {
+      // partitioned parent stores nothing itself — sum the children
+      const r = await client.query(
+        `SELECT sum(c.reltuples)::bigint AS n FROM pg_inherits i
+         JOIN pg_class c ON c.oid = i.inhrelid
+         JOIN pg_class p ON p.oid = i.inhparent
+         WHERE p.relname = 'payment';`
+      );
+      approx = r.rows[0].n;
+    } else {
+      const r = await client.query(
+        `SELECT reltuples::bigint AS n FROM pg_class c
+         JOIN pg_namespace ns ON ns.oid = c.relnamespace
+         WHERE ns.nspname='public' AND c.relname=$1;`, [table_name]
+      );
+      approx = r.rows[0]?.n ?? 0;
+    }
+
+    md += `### ${table_name}\n\n`;
+    md += `- Approximate row count: ${approx}\n`;
+    md += `- Primary key: (${pk.rows.map(r => r.column_name).join(', ') || 'none'})\n\n`;
+    md += `| Column | Type | Nullable | Default |\n|---|---|---|---|\n`;
+    for (const c of cols.rows) {
+      md += `| ${c.column_name} | ${c.data_type} | ${c.is_nullable} | ${c.column_default ?? ''} |\n`;
+    }
+    if (fks.rows.length) {
+      md += `\nForeign keys:\n`;
+      for (const fk of fks.rows) md += `- ${fk.fk_column} -> ${fk.ref_table}(${fk.ref_column})\n`;
+    }
+    md += `\n`;
+  }
+
+  md += `## Low-cardinality reference values\n\n`;
+  for (const { table, column } of LOW_CARDINALITY) {
+    const r = await client.query(`SELECT DISTINCT ${column} FROM ${table} ORDER BY 1;`);
+    md += `### ${table}.${column}\n\n`;
+    md += r.rows.map(row => `- ${row[column]}`).join('\n') + '\n\n';
+  }
+  const stores = await client.query(`SELECT store_id FROM store ORDER BY store_id;`);
+  md += `### store.store_id\n\n` + stores.rows.map(r => `- ${r.store_id}`).join('\n') + '\n';
+
+  writeFileSync('db/schema-context.md', md);
+  await client.end();
+  console.log('Wrote db/schema-context.md');
+}
+
+main().catch(e => { console.error(e); process.exit(1); });
+```
+
+Skip the payment partition child tables (`payment_p*`) if they clutter the table list: filter them out with `AND table_name NOT LIKE 'payment\_p%'` in the tables query — the LLM should only see the logical `payment` parent. **Do apply this filter** — 60+ partition entries would bloat every prompt.
+
+**Stage 4 gate:** `db/schema-context.md` exists, lists ~22 tables (partition children excluded), row counts ≈ the scaled numbers, and includes distinct values for film.rating, category.name, language.name, customer.active, store.store_id. Commit it.
+
+---
+
+# Stage 5 + 6 — Backend: libs, prompts, API routes (detailed spec)
+
+> Build order within this part: `lib/env.ts` → `lib/types.ts` → `lib/sqlGuard.ts` → `lib/db.ts` → `lib/openai.ts` → the three routes. Everything below is exact; paste-adapt rather than redesign.
+
+## B0. Verified facts and pinned backend decisions
+
+- **OpenAI API surface: use the Responses API (`client.responses.parse`), never `chat.completions.*`.** OpenAI's docs recommend Responses for all new projects (better reasoning-model results, better prompt caching). [verified by planning agent against OpenAI docs]
+- **Model IDs:** as of 2026-07 OpenAI's current generation is GPT-5.6 in three tiers: `gpt-5.6-sol` (flagship), `gpt-5.6-terra` (mid, ~half Sol's price), `gpt-5.6-luna` (cheapest). **Default `OPENAI_MODEL` = `gpt-5.6-terra`; hardcoded `FALLBACK_MODEL = "gpt-5.6-luna"`** used for one automatic retry on 429/5xx/network errors. ⚠️ EXECUTOR MUST VERIFY at build time: `curl https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY" | grep gpt-5` — if these IDs don't exist, substitute the current second-tier and cheapest-tier model IDs, keep the architecture.
+- **Never send `temperature`** — GPT-5-series reasoning models reject non-default values. Steer with `reasoning: { effort }` and `text: { verbosity }` instead.
+- **Structured outputs strict-mode rules (hard constraints):** every property must be in `required` (optionality = nullable types via `anyOf` with null); `additionalProperties: false` on every object; root must be a plain object; `minItems`/`maxItems`/`minLength` are NOT enforced by the model — cardinality rules ("1–6 panels") must live in the prompt AND be clamped in app code.
+- **PanelSpec is one flat object with nullable chart-specific fields** — NOT a discriminated union (strict-mode unions multiply schema surface and the SDK's zod converter has bugs with them).
+- **zod must stay on v3** (`zod@^3.25`): the OpenAI SDK's `zodTextFormat` helper (from `openai/helpers/zod`) is incompatible with zod v4. Do not upgrade.
+- **Supabase pooler SSL with node-postgres:** default trust store throws `self-signed certificate in certificate chain`. v1 decision: `ssl: { rejectUnauthorized: false }` (still TLS-encrypted; chain verification skipped; blast radius already limited by read-only role). CA-pinning is a documented follow-up, not part of this build.
+- **pg type parsers:** by default `pg` returns numeric/int8 as strings and dates as `Date` objects — both wrong for charts. Override OIDs 1700 (numeric→parseFloat), 20 (int8→parseInt), 1082 (date→string as-is), 1114/1184 (timestamps→ISO strings).
+- **`rowMode: 'array'`** for panel queries: rows come back as `unknown[][]` in field order — avoids the silent-collision bug when two output columns share a name.
+- **Install:** `npm install pg@^8.16 zod@^3.25 openai@^5 && npm install -D @types/pg`
+
+## B1. `lib/env.ts`
+
+Computed once at module load; throws a formatted multi-line error listing each missing var and where to get it.
+
+```ts
+// lib/env.ts
+interface Env {
+  DATABASE_URL_READONLY: string;
+  OPENAI_API_KEY: string;
+  OPENAI_MODEL: string;
+}
+
+const DEFAULT_OPENAI_MODEL = "gpt-5.6-terra";
+
+const HELP_TEXT: Record<string, string> = {
+  DATABASE_URL_READONLY:
+    "Supabase dashboard -> Project Settings -> Database -> Connection string -> " +
+    "Session pooler. Use the credentials for the read-only `dashboard_reader` " +
+    "role (NOT the default postgres role). Format: " +
+    "postgresql://dashboard_reader:<password>@<pooler-host>:5432/postgres",
+  OPENAI_API_KEY:
+    "Create one at https://platform.openai.com/api-keys " +
+    "(requires an OpenAI account with billing enabled).",
+};
+
+function readEnv(): Env {
+  const DATABASE_URL_READONLY = process.env.DATABASE_URL_READONLY;
+  const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+  const OPENAI_MODEL = process.env.OPENAI_MODEL?.trim() || DEFAULT_OPENAI_MODEL;
+
+  const missing: string[] = [];
+  if (!DATABASE_URL_READONLY) missing.push("DATABASE_URL_READONLY");
+  if (!OPENAI_API_KEY) missing.push("OPENAI_API_KEY");
+
+  if (missing.length > 0) {
+    const lines = [
+      "",
+      "=".repeat(72),
+      `Missing required environment variable(s): ${missing.join(", ")}`,
+      "",
+      "Set these in .env.local (development), then restart the server.",
+      "",
+      ...missing.flatMap((name) => [`  ${name}`, `    ${HELP_TEXT[name]}`, ""]),
+      "=".repeat(72),
+      "",
+    ];
+    throw new Error(lines.join("\n"));
+  }
+
+  return {
+    DATABASE_URL_READONLY: DATABASE_URL_READONLY!,
+    OPENAI_API_KEY: OPENAI_API_KEY!,
+    OPENAI_MODEL,
+  };
+}
+
+export const env = readEnv();
+```
+
+## B2. `lib/types.ts`
+
+zod is the single source of truth; the OpenAI JSON schema is generated from it via `zodTextFormat` at call time.
+
+```ts
+// lib/types.ts
+import { z } from "zod";
+
+export const ChartTypeSchema = z.enum(["line", "bar", "area", "pie", "stat", "table"]);
+export type ChartType = z.infer<typeof ChartTypeSchema>;
+
+export const UnitSchema = z.enum(["currency", "count", "percent", "none"]);
+export type Unit = z.infer<typeof UnitSchema>;
+
+// Flat panel spec: ALL 11 fields always present (strict structured outputs
+// forbids optional fields); non-applicable fields are null.
+export const PanelSpecSchema = z.object({
+  title: z.string(),
+  description: z.string(),
+  chartType: ChartTypeSchema,
+  sql: z.string(),
+  // line / bar / area
+  xField: z.string().nullable(),
+  yFields: z.array(z.string()).nullable(),
+  seriesField: z.string().nullable(),
+  // pie
+  labelField: z.string().nullable(),
+  // pie (value) / stat (value)
+  valueField: z.string().nullable(),
+  // all chart types (drives number formatting); null only for table panels
+  unit: UnitSchema.nullable(),
+  // stat only
+  comparison: z.string().nullable(),
+});
+export type PanelSpec = z.infer<typeof PanelSpecSchema>;
+
+export const DashboardSpecSchema = z.object({
+  title: z.string(),
+  summary: z.string(), // one plain-English sentence shown under the dashboard title
+  panels: z.array(PanelSpecSchema), // 1-6 cap enforced in route code, not schema
+});
+export type DashboardSpec = z.infer<typeof DashboardSpecSchema>;
+
+// Panel ids are assigned SERVER-SIDE by /api/dashboard after generation
+// (`panel-0`, `panel-1`, ...) — never by the LLM. The frontend keys its
+// per-panel state on them.
+export type PanelWithId = PanelSpec & { id: string };
+export type DashboardSpecWithIds = {
+  title: string;
+  summary: string;
+  panels: PanelWithId[];
+};
+
+// Repair call structured output
+export const RepairSqlSchema = z.object({ sql: z.string() });
+
+// ---- API request bodies ----
+export const DashboardRequestSchema = z.object({
+  question: z.string().trim().min(1).max(500),
+});
+export const PanelRequestSchema = z.object({
+  sql: z.string().trim().min(1).max(10_000),
+  chartType: ChartTypeSchema,
+});
+export const RepairRequestSchema = z.object({
+  question: z.string().trim().min(1).max(500),
+  panel: PanelSpecSchema,
+  sql: z.string().trim().min(1).max(10_000),
+  errorMessage: z.string().trim().min(1).max(2_000),
+});
+
