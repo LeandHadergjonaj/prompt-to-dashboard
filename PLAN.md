@@ -1069,3 +1069,357 @@ All three share an `errorResponse(status, code, friendlyMessage, debug)` helper 
 - Catch: pg code `57014` → 504 `query_timeout`, friendly "That query took too long to run and was cancelled. Try narrowing the date range or asking a simpler question." Anything else → 500 `query_failed`, friendly "Something went wrong running that chart's query."
 - **Invariant: no code path calls `executePanelQuery` on a string that didn't just pass `checkSql` in the same request** — including repaired SQL resubmitted by the frontend.
 
+### `app/api/repair/route.ts`
+- Reads schema context at module load (same pattern).
+- `POST { question, panel, sql, errorMessage }` → zod-parse (400).
+- `repairSql(...)` → on throw: 502 `llm_error`, friendly "The assistant couldn't fix this chart's query. Try adjusting your original question instead."
+- Guard-check the repaired SQL; if it fails → same 502 `llm_error` (debug: `repaired sql failed sqlGuard: <reason>`).
+- 200: `{ sql: guard.sanitizedSql }` — frontend passes it straight back to `/api/panel` (which re-validates anyway).
+- Note: the `panel` the frontend sends back includes the server-assigned `id`; zod v3 objects strip unknown keys by default, so `PanelSpecSchema` accepts it unchanged.
+
+---
+
+# Stage 7 — Frontend (detailed spec)
+
+> All components import shared types from `lib/types.ts` (Stage 5): `PanelWithId`, `DashboardSpecWithIds`, `ColumnMeta`, `ChartType`, `Unit`. Frontend-only types (`Phase`, `PanelStatus`, `PanelState`) live in `hooks/useDashboard.ts`. **`app/layout.tsx` is the only Server Component**; `app/page.tsx`, everything under `components/`, and the hook all start with `'use client'`. `lib/format.ts` is plain TS, no directive.
+
+## F1. File inventory
+
+| Path | Responsibility |
+|---|---|
+| `app/layout.tsx` | HTML shell; system font; page background; no next/font. |
+| `app/page.tsx` | View switch on `phase`; owns `EXAMPLES` and the `?debug=1` flag. |
+| `lib/format.ts` | All pure transforms/formatters + palette (full code below). |
+| `hooks/useDashboard.ts` | Fetch-orchestration state machine (full code below). |
+| `components/PromptBar.tsx` | Input + submit; native form Enter-to-submit. |
+| `components/ExampleChips.tsx` | 4 example-question pill buttons. |
+| `components/DashboardView.tsx` | Dashboard header + responsive panel grid. |
+| `components/PanelCard.tsx` | Panel chrome; dispatches skeleton/repairing/chart/error; debug SQL block. |
+| `components/PanelError.tsx` | Friendly failure card (copy §F7). |
+| `components/EmptyPanel.tsx` | "No data for this one" card. |
+| `components/charts/ChartRenderer.tsx` | Field resolution → pivot/rollup → dispatch to chart component; table fallback. |
+| `components/charts/{LineChartPanel,BarChartPanel,AreaChartPanel,PiePanel,StatPanel,TablePanel}.tsx` | One file per chart type. |
+
+## F2. `lib/format.ts` — exact implementation
+
+```ts
+import type { PanelWithId, ColumnMeta, Unit } from './types';
+
+// ---------- guards ----------
+
+export function safeNumber(raw: unknown): number | null {
+  if (raw === null || raw === undefined) return null;
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+// ---------- row shaping ----------
+
+export function toObjects(
+  columns: ColumnMeta[],
+  rows: unknown[][]
+): Record<string, unknown>[] {
+  return rows.map((row) =>
+    Object.fromEntries(columns.map((col, i) => [col.name, row[i] === undefined ? null : row[i]]))
+  );
+}
+
+export function inferColumnKind(values: unknown[]): 'number' | 'date' | 'string' {
+  const nonNull = values.filter((v) => v !== null && v !== undefined);
+  if (nonNull.length === 0) return 'string';
+  if (nonNull.every((v) => safeNumber(v) !== null)) return 'number';
+  const allDate = nonNull.every((v) => {
+    if (typeof v === 'number') return false;
+    const d = new Date(v as string);
+    return !Number.isNaN(d.getTime());
+  });
+  return allDate ? 'date' : 'string';
+}
+
+// ---------- field resolution / fallback ----------
+
+export interface ResolvedFields {
+  xField?: string;
+  yFields: string[];
+  seriesField?: string;
+  labelField?: string;
+  valueField?: string;
+}
+
+export function resolveFields(
+  panel: PanelWithId,
+  columns: ColumnMeta[],
+  objects: Record<string, unknown>[]
+): ResolvedFields {
+  const names = new Set(columns.map((c) => c.name));
+  const kindByName = new Map(
+    columns.map((c) => [c.name, inferColumnKind(objects.map((o) => o[c.name]))])
+  );
+  const numericCols = columns.filter((c) => kindByName.get(c.name) === 'number').map((c) => c.name);
+  const otherCols = columns.filter((c) => kindByName.get(c.name) !== 'number').map((c) => c.name);
+
+  const xField = panel.xField && names.has(panel.xField) ? panel.xField : otherCols[0];
+  let yFields = (panel.yFields ?? []).filter((f) => names.has(f));
+  if (yFields.length === 0) yFields = numericCols.filter((n) => n !== xField);
+  const seriesField = panel.seriesField && names.has(panel.seriesField) ? panel.seriesField : undefined;
+  const labelField = panel.labelField && names.has(panel.labelField) ? panel.labelField : otherCols[0];
+  const valueField = panel.valueField && names.has(panel.valueField) ? panel.valueField : numericCols[0];
+
+  return { xField, yFields, seriesField, labelField, valueField };
+}
+
+// ---------- long → wide pivot ----------
+
+export interface PivotResult {
+  data: Record<string, unknown>[];
+  seriesKeys: string[];
+  overflowCount: number;
+}
+
+// Cap at 12 series (top 12 by total value; rest dropped). Only 8 palette hues:
+// series 9-12 reuse hues 1-4 with a dashed stroke as the non-color encoding.
+export function pivotLongToWide(
+  objects: Record<string, unknown>[],
+  xField: string,
+  seriesField: string,
+  yField: string,
+  maxSeries = 12
+): PivotResult {
+  const totals = new Map<string, number>();
+  for (const o of objects) {
+    const key = o[seriesField] == null ? 'Unknown' : String(o[seriesField]);
+    totals.set(key, (totals.get(key) ?? 0) + (safeNumber(o[yField]) ?? 0));
+  }
+  const ranked = [...totals.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => k);
+  const keptSeries = ranked.slice(0, maxSeries);
+  const keptSet = new Set(keptSeries);
+  const overflowCount = Math.max(0, ranked.length - maxSeries);
+
+  const byX = new Map<string, Record<string, unknown>>();
+  for (const o of objects) {
+    const seriesKey = o[seriesField] == null ? 'Unknown' : String(o[seriesField]);
+    if (!keptSet.has(seriesKey)) continue;
+    const xVal = o[xField];
+    const rowKey = String(xVal);
+    if (!byX.has(rowKey)) byX.set(rowKey, { [xField]: xVal });
+    byX.get(rowKey)![seriesKey] = safeNumber(o[yField]);
+  }
+  return { data: [...byX.values()], seriesKeys: keptSeries, overflowCount };
+}
+
+// ---------- pie "Other" rollup ----------
+
+export interface PieSlice {
+  name: string;
+  value: number;
+}
+
+export function rollupPieSlices(
+  objects: Record<string, unknown>[],
+  labelField: string,
+  valueField: string,
+  maxSlices = 8
+): { slices: PieSlice[]; overflow: boolean } {
+  const rows: PieSlice[] = objects
+    .map((o) => ({
+      name: o[labelField] == null ? 'Unknown' : String(o[labelField]),
+      value: safeNumber(o[valueField]) ?? 0,
+    }))
+    .filter((r) => r.value > 0);
+  rows.sort((a, b) => b.value - a.value);
+  if (rows.length <= maxSlices) return { slices: rows, overflow: false };
+  const top = rows.slice(0, maxSlices - 1);
+  const otherValue = rows.slice(maxSlices - 1).reduce((sum, r) => sum + r.value, 0);
+  return { slices: [...top, { name: 'Other', value: otherValue }], overflow: true };
+}
+
+// ---------- date granularity + formatting ----------
+
+export type DateGranularity = 'year' | 'month' | 'day' | 'none';
+
+export function detectDateGranularity(values: unknown[]): DateGranularity {
+  const dates = values
+    .map((v) => (v == null ? null : new Date(v as string)))
+    .filter((d): d is Date => d !== null && !Number.isNaN(d.getTime()));
+  if (dates.length === 0 || dates.length !== values.length) return 'none';
+  const allFirstOfMonth = dates.every((d) => d.getUTCDate() === 1);
+  const allJanuary = dates.every((d) => d.getUTCMonth() === 0);
+  if (allFirstOfMonth && allJanuary) return 'year';
+  if (allFirstOfMonth) return 'month';
+  return 'day';
+}
+
+// timeZone pinned to UTC deliberately: date_trunc results are UTC midnight;
+// local-zone formatting would shift the shown date back a day for negative-
+// offset users. Do not remove.
+export function formatDateTick(raw: unknown, granularity: DateGranularity): string {
+  if (granularity === 'none') return raw == null ? '' : String(raw);
+  const d = new Date(raw as string);
+  if (Number.isNaN(d.getTime())) return String(raw);
+  if (granularity === 'year') return new Intl.DateTimeFormat('en-US', { year: 'numeric', timeZone: 'UTC' }).format(d);
+  if (granularity === 'month') return new Intl.DateTimeFormat('en-US', { month: 'short', year: 'numeric', timeZone: 'UTC' }).format(d);
+  return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(d);
+}
+
+// ---------- number formatting ----------
+
+export function formatCompactNumber(n: number): string {
+  const abs = Math.abs(n);
+  const sign = n < 0 ? '-' : '';
+  if (abs >= 1_000_000_000) return `${sign}${(abs / 1_000_000_000).toFixed(1).replace(/\.0$/, '')}B`;
+  if (abs >= 1_000_000) return `${sign}${(abs / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  if (abs >= 1_000) return `${sign}${(abs / 1_000).toFixed(1).replace(/\.0$/, '')}k`;
+  return `${sign}${abs}`;
+}
+
+export function formatCurrencyFull(n: number): string {
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
+}
+
+export function formatCountFull(n: number): string {
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(n);
+}
+
+// percent values arrive already scaled 0-100 (the prompt defines unit
+// "percent" that way for the LLM).
+export function formatPercent(n: number): string {
+  return `${(Math.round(n * 10) / 10).toFixed(1)}%`;
+}
+
+export function formatUnitValue(raw: unknown, unit: Unit | null | undefined, mode: 'axis' | 'tooltip' | 'stat'): string {
+  const n = safeNumber(raw);
+  if (n === null) return '—';
+  switch (unit) {
+    case 'currency':
+      return mode === 'tooltip' || mode === 'stat' ? formatCurrencyFull(n) : `$${formatCompactNumber(n)}`;
+    case 'percent':
+      return formatPercent(n);
+    default:
+      return mode === 'tooltip' ? formatCountFull(n) : mode === 'stat' ? formatCountFull(n) : formatCompactNumber(n);
+  }
+}
+
+// ---------- palette ----------
+
+// Validated against a white surface with the dataviz palette validator: all
+// hard gates pass. Three hues (magenta/amber/aqua) fall below 3:1 text
+// contrast on white, so palette colors are used ONLY as fills/strokes — all
+// text renders in ink colors (#0b0b0b / #52514e).
+export const PALETTE = [
+  '#2a78d6', // blue
+  '#008300', // green
+  '#e87ba4', // magenta/rose
+  '#eda100', // amber
+  '#1baf7a', // aqua/teal
+  '#eb6834', // orange
+  '#4a3aa7', // violet
+  '#e34948', // red
+] as const;
+
+export function colorForSeriesIndex(i: number): string {
+  return PALETTE[i % PALETTE.length];
+}
+
+export function dashArrayForSeriesIndex(i: number): string | undefined {
+  return i < PALETTE.length ? undefined : '6 3';
+}
+```
+
+## F3. `hooks/useDashboard.ts` — exact state machine
+
+Handles the nested error body `{ error: { code, friendlyMessage, debug } }` from Stage 6, feeds the RAW error (`debug`, which carries the Postgres message) to `/api/repair`, and aborts superseded requests. Note on the mutual `runPanel` ⇄ `attemptRepair` reference: declare both with `useCallback` in the order below — each render recreates both together, so the closure capture is correct; silence the exhaustive-deps lint on the two lines that reference the later-declared function.
+
+```ts
+'use client';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { DashboardSpecWithIds, PanelWithId, ColumnMeta } from '@/lib/types';
+
+export type Phase = 'idle' | 'planning' | 'rendering' | 'done' | 'error';
+export type PanelStatus = 'loading' | 'repairing' | 'ready' | 'failed';
+
+export interface PanelState {
+  status: PanelStatus;
+  sql: string; // sql currently in effect (original or repaired)
+  columns?: ColumnMeta[];
+  rows?: unknown[][];
+  truncated?: boolean;
+  error?: { friendlyMessage: string; debug?: string | null };
+}
+
+interface DashboardState {
+  phase: Phase;
+  question: string;
+  spec: DashboardSpecWithIds | null;
+  panels: Record<string, PanelState>;
+  dashboardError: string | null;
+}
+
+const GENERIC_DASHBOARD_ERROR =
+  'Something went wrong on our end. Try again, or try asking in a different way.';
+const GENERIC_PANEL_ERROR =
+  "We tried a couple of ways to build this one, but it's not working right now.";
+
+class FriendlyError extends Error {}
+
+type ApiErrorShape = { code?: string; friendlyMessage?: string; debug?: string | null };
+
+export function useDashboard() {
+  const [state, setState] = useState<DashboardState>({
+    phase: 'idle', question: '', spec: null, panels: {}, dashboardError: null,
+  });
+
+  const dashboardControllerRef = useRef<AbortController | null>(null);
+  const panelControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const currentQuestionRef = useRef('');
+
+  const abortAll = useCallback(() => {
+    dashboardControllerRef.current?.abort();
+    dashboardControllerRef.current = null;
+    for (const c of panelControllersRef.current.values()) c.abort();
+    panelControllersRef.current.clear();
+  }, []);
+
+  useEffect(() => () => abortAll(), [abortAll]);
+
+  const setPanel = useCallback((id: string, patch: Partial<PanelState>) => {
+    setState((s) => ({ ...s, panels: { ...s.panels, [id]: { ...s.panels[id], ...patch } as PanelState } }));
+  }, []);
+
+  const maybeFinish = useCallback(() => {
+    setState((s) => {
+      const allSettled = Object.values(s.panels).every((p) => p.status === 'ready' || p.status === 'failed');
+      if (allSettled && s.phase === 'rendering') return { ...s, phase: 'done' };
+      return s;
+    });
+  }, []);
+
+  const runPanel = useCallback(
+    async (panel: PanelWithId, signal: AbortSignal, sqlOverride?: string, isRepairRun = false) => {
+      const sql = sqlOverride ?? panel.sql;
+      setPanel(panel.id, { status: isRepairRun ? 'repairing' : 'loading', sql });
+      try {
+        const res = await fetch('/api/panel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sql, chartType: panel.chartType }),
+          signal,
+        });
+        const body = await res.json().catch(() => null);
+        if (res.ok && body && !body.error) {
+          setPanel(panel.id, { status: 'ready', columns: body.columns, rows: body.rows, truncated: body.truncated });
+          maybeFinish();
+          return;
+        }
+        const errBody: ApiErrorShape | undefined = body?.error;
+        const friendlyMessage = errBody?.friendlyMessage ?? GENERIC_PANEL_ERROR;
+        if (isRepairRun) {
+          setPanel(panel.id, { status: 'failed', error: { friendlyMessage, debug: errBody?.debug } });
+          maybeFinish();
+          return;
+        }
+        // Raw DB error lives in debug — that's what the repair prompt needs.
+        const rawError = (errBody?.debug ?? errBody?.friendlyMessage ?? 'unknown error').slice(0, 2000);
+        await attemptRepair(panel, signal, sql, rawError);
+      } catch (err) {
+        if ((err as { name?: string }).name === 'AbortError') return;
+        if (isRepairRun) {
