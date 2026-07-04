@@ -712,3 +712,360 @@ export const RepairRequestSchema = z.object({
   errorMessage: z.string().trim().min(1).max(2_000),
 });
 
+// ---- API response bodies ----
+export const ColumnMetaSchema = z.object({
+  name: z.string(),
+  type: z.enum(["number", "date", "boolean", "string"]),
+});
+export type ColumnMeta = z.infer<typeof ColumnMetaSchema>;
+
+export type DashboardResponse = { spec: DashboardSpecWithIds };
+export type PanelResponse = {
+  columns: ColumnMeta[];
+  rows: unknown[][];
+  truncated: boolean;
+};
+export type RepairResponse = { sql: string };
+
+// ---- Error taxonomy (shared by all three routes) ----
+export const ApiErrorCodeSchema = z.enum([
+  "invalid_request", // body failed zod validation
+  "sql_rejected",    // sqlGuard rejected the SQL
+  "llm_error",       // OpenAI call failed / unusable output
+  "query_timeout",   // statement_timeout fired (pg code 57014)
+  "query_failed",    // any other Postgres error
+  "internal_error",
+]);
+export type ApiErrorCode = z.infer<typeof ApiErrorCodeSchema>;
+export type ApiErrorBody = {
+  error: { code: ApiErrorCode; friendlyMessage: string; debug: string | null };
+};
+```
+
+The generated OpenAI schema (`zodTextFormat(DashboardSpecSchema, "dashboard_spec")`) must come out with: every property in `required`, `additionalProperties: false` everywhere, nullable fields as `anyOf: [{type:"X"},{type:"null"}]`. If the helper misbehaves, hand-roll that JSON schema to exactly those rules.
+
+## B3. `lib/sqlGuard.ts`
+
+Pure, synchronous. Exports:
+
+```ts
+export interface SqlGuardResult {
+  ok: boolean;
+  reason: string | null;       // non-null when ok === false
+  sanitizedSql: string | null; // non-null when ok === true
+}
+export function checkSql(rawSql: string): SqlGuardResult;
+export function wrapForExecution(sanitizedSql: string): string;
+```
+
+`checkSql` algorithm, in exact order:
+1. **Strip comments:** block comments `/\/\*[\s\S]*?\*\//g` → single space; then line comments `/--.*$/gm` → "". (Accepted v1 limitation: doesn't parse string literals; over-stripping can only over-reject, never smuggle a write through.)
+2. **Trim** whitespace.
+3. **Reject if empty** → reason `"query is empty after removing comments"`.
+4. **Strip one trailing semicolon** (`/;\s*$/`), then **reject if any `;` remains** → `"multiple SQL statements are not allowed"`. Runs before keyword scan so `SELECT 1; DROP …` dies here deterministically.
+5. **Must match `/^\s*(SELECT|WITH)\b/i`** → else `"query must start with SELECT or WITH"`.
+6. **Forbidden-keyword scan** — case-insensitive `\b<KEYWORD>\b` per keyword; `_` is a word char so `updated_at`/`created_by` don't false-positive. First match → `"forbidden keyword: <KW>"`. Exact list:
+   `INSERT, UPDATE, DELETE, MERGE, UPSERT, DROP, ALTER, TRUNCATE, CREATE, COMMENT, GRANT, REVOKE, EXECUTE, CALL, DO, PREPARE, DEALLOCATE, COPY, VACUUM, ANALYZE, REINDEX, CLUSTER, REFRESH, LOCK, LISTEN, NOTIFY, UNLISTEN, SET, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, INTO`
+   (`INTO` blocks `SELECT … INTO new_table`, which starts with SELECT but creates a table. Accepted trade-off: a literal like `'Drop Dead Fred'` over-rejects — safe direction, and auto-repair mitigates.)
+7. Pass → `{ ok: true, reason: null, sanitizedSql: <string as of step 4> }`.
+
+```ts
+export function wrapForExecution(sanitizedSql: string): string {
+  return `SELECT * FROM (\n${sanitizedSql}\n) AS _panel LIMIT 5001`;
+}
+```
+Only ever called on guard-passed SQL (semicolon already stripped — otherwise the wrap is syntactically invalid). `WITH … SELECT` wraps fine as a subquery body.
+
+Unit tests (put in `lib/sqlGuard.test.ts` or verify via a scratch script) — exact cases:
+| # | Input | Expect |
+|---|---|---|
+| 1 | `SELECT store_id, SUM(amount) AS total_revenue FROM payment GROUP BY store_id` | ok |
+| 2 | `-- monthly revenue` + CTE query ending `;` | ok; comment + `;` stripped |
+| 3 | `SELECT customer_id, updated_at FROM customer` | ok (no false positive on `updated_at`) |
+| 4 | `SELECT title FROM film WHERE title = 'Dropbox Promo Night'` | ok (`Dropbox` ≠ `\bDROP\b`) |
+| 5 | `SELECT * FROM payment; DROP TABLE payment;` | reject: multiple statements |
+| 6 | `DELETE FROM payment WHERE payment_id = 1` | reject: must start with SELECT/WITH |
+| 7 | `SELECT * INTO backup_payment FROM payment` | reject: forbidden keyword INTO |
+| 8 | `SELECT title FROM film WHERE title = 'Drop Dead Fred'` | reject (documented accepted false positive) |
+
+## B4. `lib/db.ts`
+
+```ts
+// lib/db.ts
+import { Pool, types } from "pg";
+import { env } from "./env";
+import { wrapForExecution } from "./sqlGuard";
+import type { ColumnMeta } from "./types";
+
+// numeric + int8 -> numbers (safe: values < 2^53); dates/timestamps -> ISO strings
+types.setTypeParser(1700, (v: string) => parseFloat(v));
+types.setTypeParser(20, (v: string) => parseInt(v, 10));
+types.setTypeParser(1082, (v: string) => v);                       // 'YYYY-MM-DD'
+types.setTypeParser(1114, (v: string) => v.replace(" ", "T"));
+types.setTypeParser(1184, (v: string) => {
+  const iso = v.replace(" ", "T");
+  return iso.endsWith("+00") ? iso.slice(0, -3) + "Z" : iso;
+});
+
+export const pool = new Pool({
+  connectionString: env.DATABASE_URL_READONLY,
+  max: 5,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 10_000,
+  statement_timeout: 19_000, // just under the role's 20s backstop
+  ssl: { rejectUnauthorized: false },
+});
+
+const NUMBER_OIDS = new Set([20, 21, 23, 700, 701, 1700]);
+const DATE_OIDS = new Set([1082, 1114, 1184]);
+const BOOLEAN_OIDS = new Set([16]);
+
+export function normalizeColumnType(oid: number): ColumnMeta["type"] {
+  if (NUMBER_OIDS.has(oid)) return "number";
+  if (DATE_OIDS.has(oid)) return "date";
+  if (BOOLEAN_OIDS.has(oid)) return "boolean";
+  return "string";
+}
+
+export interface PanelQueryResult {
+  columns: ColumnMeta[];
+  rows: unknown[][];
+  truncated: boolean;
+}
+
+const WRAP_LIMIT = 5001;
+const DISPLAY_LIMIT = 5000;
+
+export async function executePanelQuery(sanitizedSql: string): Promise<PanelQueryResult> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN TRANSACTION READ ONLY");
+    const result = await client.query({ text: wrapForExecution(sanitizedSql), rowMode: "array" });
+    await client.query("COMMIT");
+
+    const columns: ColumnMeta[] = result.fields.map((f) => ({
+      name: f.name,
+      type: normalizeColumnType(f.dataTypeID),
+    }));
+    const truncated = result.rows.length >= WRAP_LIMIT;
+    const rows = truncated ? result.rows.slice(0, DISPLAY_LIMIT) : result.rows;
+    return { columns, rows, truncated };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+```
+
+Rules: never `pool.query()` for panel execution (BEGIN/COMMIT must share one client); `pool` is a module singleton — never construct a second Pool; timeout classification (`err.code === "57014"`) happens in the route.
+
+## B5. `lib/openai.ts` + prompts (verbatim)
+
+```ts
+// lib/openai.ts
+import OpenAI from "openai";
+import { zodTextFormat } from "openai/helpers/zod";
+import { env } from "./env";
+import {
+  DashboardSpecSchema, RepairSqlSchema,
+  type DashboardSpec, type PanelSpec,
+} from "./types";
+
+const FALLBACK_MODEL = "gpt-5.6-luna";
+const client = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+
+export class LlmError extends Error {
+  readonly code = "llm_error" as const;
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = "LlmError";
+  }
+}
+
+function isRetriableError(err: unknown): boolean {
+  if (err instanceof OpenAI.APIError) {
+    return err.status === 429 || (err.status !== undefined && err.status >= 500);
+  }
+  return true; // network errors, aborts
+}
+
+async function callWithFallback<T>(fn: (model: string) => Promise<T>): Promise<T> {
+  try {
+    return await fn(env.OPENAI_MODEL);
+  } catch (err) {
+    if (!isRetriableError(err)) throw new LlmError("OpenAI call failed (non-retriable)", err);
+    try {
+      return await fn(FALLBACK_MODEL);
+    } catch (fallbackErr) {
+      throw new LlmError("OpenAI call failed on primary and fallback model", fallbackErr);
+    }
+  }
+}
+
+export interface GenerateDashboardParams {
+  question: string;
+  currentDate: string;   // 'YYYY-MM-DD'
+  schemaContext: string; // contents of db/schema-context.md
+}
+
+export async function generateDashboardSpec(params: GenerateDashboardParams): Promise<DashboardSpec> {
+  const systemPrompt = buildDashboardSystemPrompt(params);
+  return callWithFallback(async (model) => {
+    const response = await client.responses.parse({
+      model,
+      input: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: params.question },
+      ],
+      reasoning: { effort: "medium" },
+      text: { verbosity: "low", format: zodTextFormat(DashboardSpecSchema, "dashboard_spec") },
+      max_output_tokens: 4000,
+    });
+    if (!response.output_parsed) throw new LlmError("model returned no parseable dashboard spec", response);
+    return response.output_parsed;
+  });
+}
+
+export interface RepairSqlParams {
+  question: string;
+  panel: PanelSpec;
+  sql: string;
+  errorMessage: string;
+  schemaContext: string;
+}
+
+export async function repairSql(params: RepairSqlParams): Promise<string> {
+  const systemPrompt = buildRepairSystemPrompt(params.schemaContext);
+  const userPrompt = buildRepairUserPrompt(params);
+  return callWithFallback(async (model) => {
+    const response = await client.responses.parse({
+      model,
+      input: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      reasoning: { effort: "low" },
+      text: { verbosity: "low", format: zodTextFormat(RepairSqlSchema, "sql_repair") },
+      max_output_tokens: 600,
+    });
+    if (!response.output_parsed) throw new LlmError("model returned no parseable repair", response);
+    return response.output_parsed.sql;
+  });
+}
+```
+
+Prompt-cache note: schema context + current date live in the **system** message; per-call content (question / failing SQL) in the **user** message — maximizes Responses-API prompt-cache reuse.
+
+### Dashboard system prompt (verbatim — paste as a template literal)
+
+```
+You are a senior data analyst embedded in a business intelligence tool for a DVD rental company that runs on the Pagila sample database (hosted on PostgreSQL). Non-technical staff type plain-English questions and you turn each question into a small dashboard specification. You never talk to the user directly — you only produce a single structured JSON object that exactly matches the provided output schema. Do not include any prose, explanation, or markdown outside the JSON.
+
+## Today's date
+Today's date is ${currentDate} (YYYY-MM-DD). The database contains data from 2022-01-01 up to and including today. When the user uses a relative time phrase:
+- "last year" / "past year" / "trailing year" -> the 365 days ending today, i.e. WHERE payment_date >= (DATE '${currentDate}' - INTERVAL '1 year')
+- "this year" / "year to date" / "YTD" -> WHERE payment_date >= date_trunc('year', DATE '${currentDate}')
+- "last month" -> the calendar month immediately before the current calendar month
+- "this month" -> the current calendar month to date
+- "last quarter" -> the calendar quarter immediately before the current one
+- "last N days/weeks/months" -> the trailing N days/weeks/months ending today
+- If no time period is mentioned and the question is naturally about "all time" (e.g. "which films are most popular"), do not add a date filter.
+Always compute relative dates using the literal date '${currentDate}' in the SQL itself (e.g. DATE '${currentDate}' - INTERVAL '1 year') rather than CURRENT_DATE, so results are reproducible.
+
+## Database schema
+You may ONLY reference tables and columns that appear below. If a question cannot be answered exactly with this schema, do the closest reasonable thing with the data available rather than inventing columns or tables.
+
+<schema>
+${schemaContext}
+</schema>
+
+## SQL rules (hard requirements)
+1. Every panel's `sql` must be a single read-only PostgreSQL statement. It must start with SELECT or WITH. Never use INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE, MERGE, CALL, or COPY, or any statement that writes data or metadata.
+2. Never include a trailing semicolon or more than one statement.
+3. Always alias every aggregate or computed expression with a clear, snake_case name (e.g. SUM(amount) AS total_revenue, COUNT(*) AS rental_count). Never leave a column named "sum", "count", "?column?", etc.
+4. Always use date_trunc('day' | 'week' | 'month' | 'quarter' | 'year', <timestamp column>) to bucket time series data. Pick the coarsest bucket that gives a readable chart (roughly 6-30 points): day for spans of six weeks or less, week for up to about six months, month for up to a few years, year for multi-year spans.
+5. Unless the query is already aggregated (GROUP BY, or a single summary row), add LIMIT 1000. Aggregated queries whose result is naturally small (grouped by store, by category, by month, etc.) do not need an additional LIMIT, but never return raw, row-level data without one.
+6. Revenue / money questions always use the payment.amount column, summed. Never use film.replacement_cost or rental counts alone as a proxy for revenue.
+7. When a question asks for results "by store" or "per store", attribute the transaction to the store of the staff member who processed it: join payment to staff on payment.staff_id = staff.staff_id, then staff to store on staff.store_id = store.store_id. Do not use customer.store_id for this purpose — that is the customer's home store, not the store where the transaction happened.
+8. When a question involves film genre or category, join film_category (film_category.film_id = film.film_id) to category (category.category_id = film_category.category_id) and group by category.name.
+9. When a question involves customers, join through customer.customer_id; when it involves rentals, join rental.customer_id and rental.inventory_id -> inventory.film_id -> film.
+10. Prefer explicit JOIN ... ON syntax over comma joins. Always qualify ambiguous column names with a table alias.
+11. Never use SELECT *; always select explicit columns.
+
+## Choosing chart types
+- "stat": a single headline number (a total, an average, a count) with no breakdown — the SQL must return exactly one row. Use valueField for the number, and comparison for a one-clause plain-English comparison (e.g. "vs. $12,400 the prior year") only if the SQL actually computes that comparison value; otherwise null.
+- "line": a trend over a continuous time axis — use when the question involves change over time with more than about 8 points. Use xField for the date/time bucket column and yFields for one or more numeric columns. Use seriesField only when the data is split into multiple named series (e.g. one line per store); otherwise null.
+- "bar": comparing a metric across a small number of discrete categories (stores, categories, ratings, top-N films), or a short time series with few buckets (8 or fewer). Use xField for the category column and yFields for the numeric column(s).
+- "area": like line, but for emphasizing a cumulative total or volume under the curve. Use the same field convention as line.
+- "pie": a proportion/share breakdown across at most 6 categories that sum to a meaningful whole (e.g. rentals by category). Use labelField and valueField. Never use pie for more than 6 categories, and never for time series — use "bar" instead if there are more than 6 categories.
+- "table": a ranked list or row-level detail (e.g. "top 10 customers", "list of overdue rentals") where the individual rows matter more than a visual trend. Set every mapping field (xField, yFields, seriesField, labelField, valueField, unit, comparison) to null for table panels; the table renders every returned column.
+- For every non-table panel, set unit to exactly one of: "currency" (money values, formatted with $), "count" (plain quantities), "percent" (values already scaled 0-100), or "none". It controls how numbers are formatted on axes, tooltips, and stat values.
+
+## Building the dashboard
+- Produce between 1 and 6 panels. Prefer fewer, well-chosen panels over many redundant ones.
+- If the question is broad (e.g. "build me a dashboard on customer rentals", "show me a sales dashboard"), start with one "stat" panel giving the single most important headline number, followed by 2-4 panels that break that headline down by time, category, or store.
+- If the question is narrow and asks for one specific thing (e.g. "revenue by store over the last year"), return the single most appropriate panel (usually "bar" or "line"), plus optionally one "stat" panel with the overall total if that adds real value.
+- Every panel needs a short human title (60 characters or fewer) and a one-sentence plain-English description of what it shows (e.g. "Total rental revenue for each store over the trailing 12 months.").
+- Give the whole dashboard a short title (80 characters or fewer) that reflects the user's question, and a one-sentence plain-English summary (the summary field) describing what the dashboard shows.
+
+## Output format
+Return only the JSON object described by the response schema. Do not wrap it in markdown code fences. Do not add commentary before or after it.
+```
+
+### Repair system prompt (verbatim)
+
+```
+You are a PostgreSQL expert fixing a single broken query inside a dashboard panel for a DVD rental company's business intelligence tool, running on the Pagila sample database. You will be given the original user question, the panel's title and chart type, the SQL that failed, and the exact database error message. Return a corrected single SELECT/WITH statement that fixes the error while still answering the original intent of the panel as closely as possible.
+
+## Database schema
+<schema>
+${schemaContext}
+</schema>
+
+## Rules
+1. The corrected SQL must be a single read-only statement starting with SELECT or WITH. No trailing semicolon. Never use INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE, MERGE, CALL, or COPY.
+2. Only reference tables and columns that appear in the schema above.
+3. Preserve the original panel's intent (same grouping, breakdown, and time range) unless the error means that intent is impossible with this schema, in which case make the smallest reasonable change.
+4. Always alias aggregate or computed columns with clear snake_case names.
+5. If the error indicates a timeout, add or tighten a LIMIT, narrow the aggregation, or add a missing date-range filter rather than simply resubmitting the same query unchanged.
+6. Return only the corrected SQL as the sql field of the JSON response. Do not include a trailing semicolon, comments, or any explanation.
+```
+
+### Repair user prompt (verbatim template)
+
+```
+Original question: "${question}"
+Panel title: "${panel.title}"
+Chart type: ${panel.chartType}
+Panel description: "${panel.description}"
+
+Failing SQL:
+${sql}
+
+Database error message:
+${errorMessage}
+
+Fix this query.
+```
+
+## B6. The three API routes
+
+All three share an `errorResponse(status, code, friendlyMessage, debug)` helper returning `{ error: { code, friendlyMessage, debug } }`. `friendlyMessage` is safe for the UI; `debug` (raw detail) is never shown by default.
+
+### `app/api/dashboard/route.ts`
+- Reads `db/schema-context.md` once at module load: `fs.readFileSync(path.join(process.cwd(), "db", "schema-context.md"), "utf-8")`.
+- `POST { question }` → zod-parse (400 `invalid_request` on failure; friendly: "Please enter a question between 1 and 500 characters.").
+- `currentDate = new Date().toISOString().slice(0, 10)`.
+- Call `generateDashboardSpec` → on throw: 502 `llm_error`, friendly "The assistant is having trouble right now. Please try again in a moment."
+- **Pre-filter panels and assign ids:** `const panelsWithIds = spec.panels.filter(p => checkSql(p.sql).ok).slice(0, 6).map((p, i) => ({ ...p, id: \`panel-${i}\` }))`; if zero remain → 502 `llm_error`, friendly "The assistant couldn't design a dashboard for that question. Try rephrasing it or being more specific."
+- 200: `{ spec: { title: spec.title, summary: spec.summary, panels: panelsWithIds } }`.
+
+### `app/api/panel/route.ts`
+- `POST { sql, chartType }` → zod-parse (400 `invalid_request`).
+- `checkSql(sql)` → not ok: 400 `sql_rejected`, friendly "This chart's query isn't a supported read-only query and can't be run.", debug = guard reason.
+- `executePanelQuery(guard.sanitizedSql!)` → 200 `{ columns, rows, truncated }`.
+- Catch: pg code `57014` → 504 `query_timeout`, friendly "That query took too long to run and was cancelled. Try narrowing the date range or asking a simpler question." Anything else → 500 `query_failed`, friendly "Something went wrong running that chart's query."
+- **Invariant: no code path calls `executePanelQuery` on a string that didn't just pass `checkSql` in the same request** — including repaired SQL resubmitted by the frontend.
+
