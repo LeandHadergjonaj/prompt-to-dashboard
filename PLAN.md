@@ -1784,3 +1784,355 @@ export function PromptBar({ onSubmit, disabled, defaultValue }: { onSubmit: (q: 
 }
 ```
 
+### `components/ExampleChips.tsx`
+
+```tsx
+'use client';
+export function ExampleChips({ examples, onSelect }: { examples: string[]; onSelect: (q: string) => void }) {
+  return (
+    <div className="flex flex-wrap items-center justify-center gap-2">
+      {examples.map((q) => (
+        <button
+          key={q}
+          type="button"
+          onClick={() => onSelect(q)}
+          className="rounded-full border border-gray-200 bg-white px-4 py-2 text-sm text-[#0b0b0b] transition-colors hover:border-gray-300 hover:bg-gray-50"
+        >
+          {q}
+        </button>
+      ))}
+    </div>
+  );
+}
+```
+
+### `components/DashboardView.tsx`
+
+```tsx
+'use client';
+import type { DashboardSpecWithIds } from '@/lib/types';
+import type { PanelState } from '@/hooks/useDashboard';
+import { PanelCard } from './PanelCard';
+
+export function DashboardView({
+  spec, question, panels, debug, onAskSomethingElse,
+}: { spec: DashboardSpecWithIds; question: string; panels: Record<string, PanelState>; debug: boolean; onAskSomethingElse: () => void }) {
+  return (
+    <div>
+      <header className="mb-6 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <p className="text-sm text-[#52514e]">Your question: "{question}"</p>
+          <h1 className="mt-1 text-2xl font-semibold text-[#0b0b0b]">{spec.title}</h1>
+          <p className="mt-1 text-base text-[#52514e]">{spec.summary}</p>
+        </div>
+        <button type="button" onClick={onAskSomethingElse} className="whitespace-nowrap text-sm font-medium text-[#2a78d6] hover:underline">
+          Ask something else
+        </button>
+      </header>
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+        {spec.panels.map((panel) => {
+          const spanClass =
+            panel.chartType === 'table' ? 'md:col-span-4' : panel.chartType === 'stat' ? 'md:col-span-1' : 'md:col-span-2';
+          return (
+            <div key={panel.id} className={spanClass}>
+              <PanelCard panel={panel} state={panels[panel.id]} debug={debug} />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+```
+
+### `components/PanelCard.tsx`
+
+```tsx
+'use client';
+import type { PanelWithId } from '@/lib/types';
+import type { PanelState } from '@/hooks/useDashboard';
+import { ChartRenderer } from './charts/ChartRenderer';
+import { PanelError } from './PanelError';
+
+export function PanelCard({ panel, state, debug }: { panel: PanelWithId; state: PanelState; debug: boolean }) {
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+      <div className="mb-3">
+        <h2 className="text-sm font-semibold text-[#0b0b0b]">{panel.title}</h2>
+        {panel.description && <p className="mt-0.5 text-xs text-[#52514e]">{panel.description}</p>}
+      </div>
+
+      {state.status === 'loading' && (
+        <div aria-busy="true" aria-label={`Loading chart: ${panel.title}`} className="animate-pulse space-y-3">
+          <div className="h-4 w-1/3 rounded bg-gray-200" />
+          <div className="h-[220px] w-full rounded-lg bg-gray-100" />
+        </div>
+      )}
+
+      {state.status === 'repairing' && (
+        <div aria-busy="true" className="flex h-[220px] flex-col items-center justify-center gap-2 text-sm text-[#52514e]">
+          <svg className="h-5 w-5 animate-spin text-[#eda100]" viewBox="0 0 24 24" fill="none">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+          </svg>
+          <span>Fixing this chart…</span>
+        </div>
+      )}
+
+      {state.status === 'ready' && (
+        <ChartRenderer panel={panel} columns={state.columns!} rows={state.rows!} truncated={!!state.truncated} />
+      )}
+
+      {state.status === 'failed' && <PanelError />}
+
+      {debug && (
+        <details className="mt-3 rounded-lg border border-gray-200 bg-gray-50 p-2 text-xs">
+          <summary className="cursor-pointer select-none font-medium text-gray-600">View SQL</summary>
+          <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-gray-700">{state.sql}</pre>
+          {state.status === 'failed' && state.error?.debug != null && (
+            <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-red-700">{String(state.error.debug)}</pre>
+          )}
+        </details>
+      )}
+    </div>
+  );
+}
+```
+
+### `components/PanelError.tsx` and `components/EmptyPanel.tsx`
+
+```tsx
+'use client';
+export function PanelError() {
+  return (
+    <div className="flex h-[220px] flex-col items-center justify-center gap-1 text-center">
+      <p className="text-sm font-medium text-[#0b0b0b]">This chart didn't come together</p>
+      <p className="max-w-xs text-xs text-[#52514e]">
+        We tried a couple of ways to build this one, but it's not working right now. The rest of your dashboard is fine.
+      </p>
+    </div>
+  );
+}
+```
+
+```tsx
+'use client';
+export function EmptyPanel() {
+  return (
+    <div className="flex h-[220px] flex-col items-center justify-center gap-1 text-center">
+      <p className="text-sm font-medium text-[#0b0b0b]">No data for this one</p>
+      <p className="text-xs text-[#52514e]">There's nothing to show for this question yet.</p>
+    </div>
+  );
+}
+```
+
+## F6. `app/layout.tsx` and `app/page.tsx`
+
+```tsx
+// app/layout.tsx — delete the scaffolded Geist next/font import
+import './globals.css';
+
+export const metadata = { title: 'Dashboard Builder', description: 'Ask for a dashboard in plain English.' };
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body className="font-sans antialiased bg-[#f9f9f7] text-[#0b0b0b]">{children}</body>
+    </html>
+  );
+}
+```
+
+```tsx
+// app/page.tsx
+'use client';
+import { useEffect, useState } from 'react';
+import { useDashboard } from '@/hooks/useDashboard';
+import { PromptBar } from '@/components/PromptBar';
+import { ExampleChips } from '@/components/ExampleChips';
+import { DashboardView } from '@/components/DashboardView';
+
+const EXAMPLES = [
+  'Show me revenue by store over the last year',
+  'Build me a dashboard on customer rentals',
+  'What are our top 10 most-rented movies?',
+  'Which film categories bring in the most revenue?',
+];
+
+export default function Page() {
+  const { phase, question, spec, panels, dashboardError, submit, reset, retry } = useDashboard();
+  const [debug, setDebug] = useState(false);
+
+  useEffect(() => {
+    setDebug(new URLSearchParams(window.location.search).get('debug') === '1');
+  }, []);
+
+  if (phase === 'idle' || phase === 'planning') {
+    return (
+      <div className="mx-auto flex max-w-2xl flex-col items-center gap-6 px-4 pt-24 text-center">
+        <div>
+          <h1 className="text-3xl font-semibold text-[#0b0b0b]">Ask for a dashboard in plain English.</h1>
+          <p className="mt-2 text-base text-[#52514e]">No SQL, no setup — just tell us what you want to see about your DVD rental business.</p>
+        </div>
+        <PromptBar onSubmit={submit} disabled={phase === 'planning'} defaultValue={question} />
+        {phase === 'idle' && <ExampleChips examples={EXAMPLES} onSelect={submit} />}
+        {phase === 'planning' && (
+          <div role="status" aria-live="polite" aria-busy="true" className="flex items-center justify-center gap-2 py-10">
+            <span className="flex gap-1">
+              <span className="h-2 w-2 animate-bounce rounded-full bg-[#2a78d6] [animation-delay:-0.3s]" />
+              <span className="h-2 w-2 animate-bounce rounded-full bg-[#2a78d6] [animation-delay:-0.15s]" />
+              <span className="h-2 w-2 animate-bounce rounded-full bg-[#2a78d6]" />
+            </span>
+            <span className="text-sm text-[#52514e]">Designing your dashboard…</span>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (phase === 'error') {
+    return (
+      <div className="mx-auto max-w-2xl px-4 py-6">
+        <PromptBar onSubmit={submit} />
+        <div className="mx-auto mt-16 max-w-md text-center">
+          <h1 className="text-xl font-semibold text-[#0b0b0b]">We couldn't build that dashboard</h1>
+          <p className="mt-2 text-sm text-[#52514e]">{dashboardError}</p>
+          <button type="button" onClick={retry} className="mt-4 rounded-xl bg-[#2a78d6] px-5 py-2.5 text-sm font-medium text-white hover:bg-[#1c5cab]">
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // phase is 'rendering' or 'done'
+  return (
+    <div className="mx-auto max-w-6xl px-4 py-6" aria-busy={phase === 'rendering'}>
+      <div className="mb-6"><PromptBar onSubmit={submit} /></div>
+      <DashboardView spec={spec!} question={question} panels={panels} debug={debug} onAskSomethingElse={reset} />
+    </div>
+  );
+}
+```
+
+## F7. Design tokens & copy (single source of truth)
+
+| Token | Value |
+|---|---|
+| Page background | `#f9f9f7` (on `<body>`) |
+| Card surface / border / shape | `bg-white` / `border-gray-200` / `rounded-xl shadow-sm p-4` |
+| Primary / secondary / muted ink | `#0b0b0b` / `#52514e` / `#898781` |
+| Gridline / axis line | `#e1e0d9` / `#c3c2b7` |
+| Primary action | `#2a78d6`, hover `#1c5cab` |
+| Font | Tailwind `font-sans` system stack — no web fonts |
+| Grid | container `grid grid-cols-1 gap-4 md:grid-cols-4`; stat `md:col-span-1`, chart `md:col-span-2`, table `md:col-span-4` |
+
+All user-visible copy is embedded verbatim in the component code above (empty-state headline/subline, 4 example chips, "Build my dashboard", "Designing your dashboard…", "Fixing this chart…", panel/dashboard failure cards, "No data for this one", truncation notice, "Ask something else", "Try again", "View SQL"). No SQL, stack traces, status codes, or raw errors ever render outside the `?debug=1` details block. No dark mode in v1.
+
+## F8. Accessibility & robustness minimums
+
+- Enter submits via native `<form onSubmit>` — no custom keydown handling.
+- `aria-busy` on: planning indicator (`role="status" aria-live="polite"`), each skeleton, each repairing spinner, the dashboard container while rendering.
+- Every tooltip routes through `formatUnitValue(..., 'tooltip')` — never a raw number.
+- `ChartRenderer` checks `rows.length === 0` before anything else → `EmptyPanel` for every chart type.
+- `safeNumber` is the single entry point for all numeric reads — null/undefined/non-finite always render as `—`, never `NaN`.
+- No `dangerouslySetInnerHTML` anywhere; all LLM-derived strings render as escaped JSX text.
+- Recharts 3's `accessibilityLayer` defaults to on — free keyboard navigation on chart marks. [verified]
+
+## F9. Manual QA checklist
+
+1. Load `/` — headline, subline, 4 example chips with the exact copy above.
+2. Click the revenue-by-store chip — input fills, planning state shows (bouncing dots + "Designing your dashboard…", PromptBar disabled).
+3. Type a question and press **Enter** only — same transition.
+4. On resolve — header shows `Your question: "…"`, spec title, summary, "Ask something else".
+5. Panels render skeletons immediately, then settle independently (throttle one request to confirm no blocking).
+6. Force a panel's SQL to fail twice (bad column name via debug) — see "Fixing this chart…" once, then the friendly failure card; never raw SQL.
+7. Force a zero-row result — "No data for this one" card, not a blank chart.
+8. Desktop ≥768px: stat = quarter width, charts = half, table = full row. Below 768px: all full-width stacked.
+9. A seriesField panel with 9–12 categories: series 9+ reuse hues with dashed strokes; legend text is ink-colored.
+10. A pie with >8 categories: exactly 8 wedges, gray "Other" wedge sums the tail.
+11. A panel whose spec field names don't match returned columns: silently falls back (first text/date col = x, numeric cols = y) or renders as table — never a blank card.
+12. Table with `truncated: true` shows the partial-result footer.
+13. `?debug=1` shows the View SQL block per panel (with repaired SQL after a repair); without it, never.
+14. Kill the network and submit — dashboard-level failure screen; "Try again" resubmits the same question.
+15. "Ask something else" resets to idle AND aborts in-flight panel requests (Network tab shows `(canceled)`).
+16. Submit question B while A is loading — A's requests abort; only B's results ever appear.
+17. Keyboard-only pass: input, submit, chips, links all focusable and operable.
+18. Hover charts — tooltips show unit-formatted values with series names.
+
+---
+
+# Stage 8 — End-to-end verification (canonical questions)
+
+Run each through the UI (and/or `POST /api/dashboard` + `/api/panel` via curl) and check the described shape:
+
+1. **"show me revenue by store over the last year"** → 1–2 panels; primary `bar` (only 2 stores), SQL joins payment→staff→store (NOT customer.store_id), trailing-12-month filter; optional `stat` total.
+2. **"build me a dashboard on customer rentals"** → 4–6 panels, first is `stat` headline, then a mix of `line` (monthly rentals), `bar`, `table`.
+3. **"what are the top 10 films by rental count"** → exactly 1 `table` panel, all mapping fields null, SQL with LIMIT 10.
+4. **"revenue by film category"** → `bar` with 16 categories — must NOT be `pie` (pie caps at 6; this is the chart-discipline check).
+5. **"how many rentals happened last month vs the month before"** → `stat` with populated `comparison`, or 2-category `bar`; `line`/`table` = prompt needs tightening.
+6. **"list overdue rentals right now"** → `table`; SQL filters `return_date IS NULL` and compares `rental_date + (film.rental_duration || ' days')::interval` against the current date, joined through inventory→film and customer.
+
+Pass bar: every panel's SQL returns 200 from `/api/panel` on a clean run, with repair not needed (repair firing = prompt-tightening signal, not hard failure).
+
+Run these through the real UI at `localhost:3000` (not just curl), then spot-check numbers: e.g. compare the "revenue by store" bar values against a direct `psql "$DATABASE_URL_READONLY" -c "SELECT s.store_id, sum(p.amount) FROM payment p JOIN staff st ON st.staff_id = p.staff_id JOIN store s ON s.store_id = st.store_id WHERE p.payment_date >= DATE '2026-07-18' - INTERVAL '1 year' GROUP BY 1;"`. Also walk the Stage 7 QA checklist (§F9). Finish with `npm run build` to confirm a clean production build.
+
+---
+
+# Stage 9 — Report back to the user
+
+When everything above passes, report: (1) what was built (the pipeline, the scaled dataset's final size and row counts, the app architecture in two sentences); (2) observations — anything unreliable or surprising in the data generation, the SQL the model produced, chart-type choices, query latencies on the 15M-row tables, or repair-loop behavior; (3) recommended next steps (e.g. streaming spec generation, saved dashboards, CA-pinned TLS, semantic-layer hints for tricky joins, caching panel results).
+
+---
+
+# Execution order & gates (one-page recap)
+
+| # | Stage | Gate before next |
+|---|---|---|
+| 0 | Collect credentials (ASK USER; never invent) | `psql "$DATABASE_URL" -c "select version();"` works |
+| 1 | Fetch + load pagila; extend partitions; scale customer/inventory; 15×1M rental+payment batches; indexes + ANALYZE | DB > 1GB; row counts & date ranges match |
+| 2 | `dashboard_reader` role + verify script | 5 negative checks pass, SELECT works |
+| 3 | `create-next-app@15` + pinned deps + `.env.local` | `npm run dev` serves |
+| 4 | `introspect-schema.mjs` → `db/schema-context.md` (commit it) | file complete, partitions excluded |
+| 5 | `lib/env.ts` → `lib/types.ts` → `lib/sqlGuard.ts` (+ its 8 unit cases) → `lib/db.ts` → `lib/openai.ts` | guard tests pass |
+| 6 | Three API routes | curl smoke test: `/api/dashboard` returns a spec; `/api/panel` runs a panel's SQL; a deliberately broken SQL 400s and `/api/repair` fixes it |
+| 7 | Frontend components | UI renders a live dashboard |
+| 8 | Canonical questions + QA checklist + `npm run build` | all pass |
+| 9 | Report back | — |
+
+# Open items the executor must verify at build time (all flagged inline above)
+
+1. **OpenAI model IDs** — confirm `gpt-5.6-terra` / `gpt-5.6-luna` exist via `GET /v1/models`; if the product line has moved on, substitute the current mid tier + cheapest tier, same architecture.
+2. **create-next-app into the non-empty repo** (README + .git) — if refused, scaffold in a temp dir and move files in.
+3. **Bulk-load wall-clock** — time batch 1; if ≫10 min, drop `BATCH_SIZE` to 250–500k and scale `NUM_BATCHES`.
+4. **`payment.payment_id` sequence default** — check `\d payment` before batch 1 (the INSERT omits payment_id).
+5. **Recharts 3.9.2 installability** — `npm view recharts@3.9.2` (pinned exact; 2.x is dead upstream).
+
+# What was deliberately deferred (do NOT build in v1)
+
+Auth/multi-user, saved dashboards, dashboard editing/drill-down, dark mode, streaming responses, CA-pinned TLS (documented follow-up), query-result caching, rate limiting, tests beyond the sqlGuard unit cases and the manual checklists.
+
+---
+
+# ADDENDUM (2026-07-18, post-execution): pivot to existing data
+
+During execution the target Supabase project (mkbrkjqvuqgaentojher) turned out to contain a live
+UK property-intelligence dataset (~1.28GB: land_registry_ownership ~2M rows, voa_properties ~1.6M
+rows, opportunities, company_watchlist, etc.). Per the user's direction, **Pagila was NOT loaded**;
+the dashboard system runs against this existing data instead (which already satisfies the >1GB
+requirement). Changes vs. the plan above:
+
+- Stages 1 (Pagila load/scale) skipped. All scripts remain in `db/` + `scripts/` for later use.
+- Stage 2 replaced by `db/05_dashboard_reader_existing_data.sql`: same read-only role, but
+  minimal-touch for a live project (no schema-privilege REVOKEs, no default-privilege changes) plus
+  one additive RLS policy `dashboard_reader_select` per table (all 8 tables have RLS enabled).
+- `scripts/introspect-schema.mjs` rewritten generic: auto-detected low-cardinality values,
+  top-values for high-cardinality columns, min/max ranges for date columns.
+- LLM prompts de-Pagila'd: UK property domain, text-column cast rules
+  (price_paid `NULLIF(...)::numeric`, date_proprietor_added `to_date(..., 'DD-MM-YYYY')`),
+  company_number join keys, jsonb/uuid exclusions, GBP currency (frontend formats £/en-GB).
+- Example questions + UI copy adapted to the property domain.
+- Two runtime fixes discovered live: `?sslmode=require` in the URL overrides node-postgres's
+  `ssl` object (now stripped in `lib/db.ts` + introspector), and the model sometimes fills nullable
+  spec fields with the string "/dev/null" (now normalized to null in `/api/dashboard`).
