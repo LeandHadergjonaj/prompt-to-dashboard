@@ -1423,3 +1423,364 @@ export function useDashboard() {
       } catch (err) {
         if ((err as { name?: string }).name === 'AbortError') return;
         if (isRepairRun) {
+          setPanel(panel.id, { status: 'failed', error: { friendlyMessage: GENERIC_PANEL_ERROR } });
+          maybeFinish();
+          return;
+        }
+        await attemptRepair(panel, signal, sql, 'network error');
+      }
+    },
+    [setPanel, maybeFinish] // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  const attemptRepair = useCallback(
+    async (panel: PanelWithId, signal: AbortSignal, sql: string, errorMessage: string) => {
+      setPanel(panel.id, { status: 'repairing' });
+      try {
+        const res = await fetch('/api/repair', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: currentQuestionRef.current, panel, sql, errorMessage }),
+          signal,
+        });
+        if (!res.ok) throw new Error('repair failed');
+        const { sql: repairedSql } = await res.json();
+        await runPanel(panel, signal, repairedSql, true);
+      } catch (err) {
+        if ((err as { name?: string }).name === 'AbortError') return;
+        setPanel(panel.id, { status: 'failed', error: { friendlyMessage: GENERIC_PANEL_ERROR } });
+        maybeFinish();
+      }
+    },
+    [setPanel, runPanel, maybeFinish]
+  );
+
+  const submit = useCallback(
+    async (question: string) => {
+      abortAll();
+      currentQuestionRef.current = question;
+      setState({ phase: 'planning', question, spec: null, panels: {}, dashboardError: null });
+
+      const controller = new AbortController();
+      dashboardControllerRef.current = controller;
+      try {
+        const res = await fetch('/api/dashboard', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question }),
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => null);
+          throw new FriendlyError(errBody?.error?.friendlyMessage ?? GENERIC_DASHBOARD_ERROR);
+        }
+        const { spec } = (await res.json()) as { spec: DashboardSpecWithIds };
+
+        const initialPanels: Record<string, PanelState> = {};
+        for (const p of spec.panels) initialPanels[p.id] = { status: 'loading', sql: p.sql };
+        setState({ phase: 'rendering', question, spec, panels: initialPanels, dashboardError: null });
+
+        for (const p of spec.panels) {
+          const panelController = new AbortController();
+          panelControllersRef.current.set(p.id, panelController);
+          runPanel(p, panelController.signal); // fire-and-forget: panels settle independently
+        }
+      } catch (err) {
+        if ((err as { name?: string }).name === 'AbortError') return;
+        setState({
+          phase: 'error', question, spec: null, panels: {},
+          dashboardError: err instanceof FriendlyError ? err.message : GENERIC_DASHBOARD_ERROR,
+        });
+      }
+    },
+    [abortAll, runPanel]
+  );
+
+  const reset = useCallback(() => {
+    abortAll();
+    setState({ phase: 'idle', question: '', spec: null, panels: {}, dashboardError: null });
+  }, [abortAll]);
+
+  const retry = useCallback(() => submit(currentQuestionRef.current), [submit]);
+
+  return { ...state, submit, reset, retry };
+}
+```
+
+## F4. Chart components — exact Recharts composition
+
+All chart bodies live in a fixed-height container matching `ResponsiveContainer height={280}`. `isAnimationActive={false}` on every mark. Marks per the dataviz system: 2px lines, `radius={[4,4,0,0]}` + `maxBarSize={24}` bars, 10%-opacity area fills, solid hairline gridlines, legend only for ≥2 series.
+
+### `components/charts/LineChartPanel.tsx`
+
+```tsx
+'use client';
+import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from 'recharts';
+import { colorForSeriesIndex, dashArrayForSeriesIndex, formatDateTick, formatUnitValue, type DateGranularity } from '@/lib/format';
+import type { Unit } from '@/lib/types';
+
+interface Props {
+  data: Record<string, unknown>[];
+  xField: string;
+  seriesKeys: string[];
+  unit?: Unit | null;
+  dateGranularity: DateGranularity;
+}
+
+export function LineChartPanel({ data, xField, seriesKeys, unit, dateGranularity }: Props) {
+  return (
+    <ResponsiveContainer width="100%" height={280}>
+      <LineChart data={data} margin={{ top: 8, right: 16, bottom: 8, left: 8 }}>
+        <CartesianGrid stroke="#e1e0d9" vertical={false} />
+        <XAxis
+          dataKey={xField}
+          tickFormatter={(v) => formatDateTick(v, dateGranularity)}
+          tick={{ fontSize: 12, fill: '#898781' }}
+          axisLine={{ stroke: '#c3c2b7' }}
+          tickLine={false}
+          minTickGap={24}
+        />
+        <YAxis
+          tickFormatter={(v) => formatUnitValue(v, unit, 'axis')}
+          tick={{ fontSize: 12, fill: '#898781' }}
+          axisLine={{ stroke: '#c3c2b7' }}
+          tickLine={false}
+          width={56}
+        />
+        <Tooltip
+          formatter={(value: number, name: string) => [formatUnitValue(value, unit, 'tooltip'), name]}
+          labelFormatter={(label) => formatDateTick(label, dateGranularity)}
+          contentStyle={{ borderRadius: 8, border: '1px solid rgba(11,11,11,0.10)', fontSize: 12 }}
+        />
+        {seriesKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 12 }} />}
+        {seriesKeys.map((key, i) => (
+          <Line
+            key={key}
+            type="monotone"
+            dataKey={key}
+            name={key}
+            stroke={colorForSeriesIndex(i)}
+            strokeWidth={2}
+            strokeDasharray={dashArrayForSeriesIndex(i)}
+            dot={false}
+            activeDot={{ r: 4, strokeWidth: 2, stroke: '#fcfcfb' }}
+            isAnimationActive={false}
+            connectNulls
+          />
+        ))}
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+```
+
+### `components/charts/BarChartPanel.tsx`
+
+Identical axis/grid/tooltip/legend block inside `<BarChart>`, with per-series:
+
+```tsx
+<Bar key={key} dataKey={key} name={key} fill={colorForSeriesIndex(i)}
+     radius={[4, 4, 0, 0]} maxBarSize={24} isAnimationActive={false} />
+```
+
+For categorical x-axes (granularity `'none'`) the `tickFormatter` passes values through unchanged — `formatDateTick` already does this.
+
+### `components/charts/AreaChartPanel.tsx`
+
+Identical block inside `<AreaChart>`, per-series:
+
+```tsx
+<Area key={key} type="monotone" dataKey={key} name={key}
+      stroke={colorForSeriesIndex(i)} strokeWidth={2}
+      fill={colorForSeriesIndex(i)} fillOpacity={0.1}
+      isAnimationActive={false} connectNulls />
+```
+
+Multiple series are **overlaid, never stacked** (no `stackId`) — stacking silently turns independent metrics into a cumulative total.
+
+### `components/charts/PiePanel.tsx`
+
+```tsx
+'use client';
+import { ResponsiveContainer, PieChart, Pie, Cell, Tooltip, Legend } from 'recharts';
+import { PALETTE, formatUnitValue, type PieSlice } from '@/lib/format';
+import type { Unit } from '@/lib/types';
+
+export function PiePanel({ slices, unit }: { slices: PieSlice[]; unit?: Unit | null }) {
+  return (
+    <ResponsiveContainer width="100%" height={280}>
+      <PieChart>
+        <Tooltip
+          formatter={(value: number, name: string) => [formatUnitValue(value, unit, 'tooltip'), name]}
+          contentStyle={{ borderRadius: 8, border: '1px solid rgba(11,11,11,0.10)', fontSize: 12 }}
+        />
+        {slices.length > 1 && <Legend layout="horizontal" align="center" verticalAlign="bottom" wrapperStyle={{ fontSize: 12 }} />}
+        <Pie data={slices} dataKey="value" nameKey="name" cx="50%" cy="45%" outerRadius={90}
+             stroke="#fcfcfb" strokeWidth={2} isAnimationActive={false}>
+          {slices.map((slice, i) => (
+            <Cell key={slice.name} fill={slice.name === 'Other' ? '#c3c2b7' : PALETTE[i % PALETTE.length]} />
+          ))}
+        </Pie>
+      </PieChart>
+    </ResponsiveContainer>
+  );
+}
+```
+
+"Other" is always neutral gray (`#c3c2b7`), never a categorical hue.
+
+### `components/charts/StatPanel.tsx`
+
+```tsx
+'use client';
+import { formatUnitValue } from '@/lib/format';
+import type { Unit } from '@/lib/types';
+
+export function StatPanel({ value, unit, caption }: { value: number | null; unit?: Unit | null; caption?: string | null }) {
+  return (
+    <div className="flex h-[280px] flex-col items-center justify-center gap-1 text-center">
+      <span className="text-4xl font-semibold tracking-tight text-[#0b0b0b]">{formatUnitValue(value, unit, 'stat')}</span>
+      {caption && <span className="text-sm text-[#52514e]">{caption}</span>}
+    </div>
+  );
+}
+```
+
+`caption` receives the panel's `comparison` field when non-null, else nothing (the description already renders in the card header).
+
+### `components/charts/TablePanel.tsx`
+
+```tsx
+'use client';
+import { formatCountFull } from '@/lib/format';
+import type { ColumnMeta } from '@/lib/types';
+
+export function TablePanel({ columns, rows, truncated }: { columns: ColumnMeta[]; rows: unknown[][]; truncated: boolean }) {
+  return (
+    <div className="overflow-x-auto rounded-xl border border-gray-200">
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50 text-left text-xs font-medium uppercase tracking-wide text-gray-500">
+          <tr>
+            {columns.map((c) => (
+              <th key={c.name} className="px-4 py-2 whitespace-nowrap">{c.name}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-gray-100">
+          {rows.map((row, i) => (
+            <tr key={i} className="hover:bg-gray-50">
+              {row.map((cell, j) => (
+                <td key={j} className={`px-4 py-2 whitespace-nowrap ${typeof cell === 'number' ? 'tabular-nums text-right' : 'text-left'}`}>
+                  {cell === null || cell === undefined ? '—' : typeof cell === 'number' ? formatCountFull(cell) : String(cell)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {truncated && (
+        <div className="border-t border-gray-200 bg-amber-50 px-4 py-2 text-xs text-amber-800">
+          Showing a partial result — there's more data than fits here.
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+### `components/charts/ChartRenderer.tsx` — the dispatcher
+
+```tsx
+'use client';
+import { toObjects, resolveFields, pivotLongToWide, rollupPieSlices, detectDateGranularity, safeNumber } from '@/lib/format';
+import { LineChartPanel } from './LineChartPanel';
+import { BarChartPanel } from './BarChartPanel';
+import { AreaChartPanel } from './AreaChartPanel';
+import { PiePanel } from './PiePanel';
+import { StatPanel } from './StatPanel';
+import { TablePanel } from './TablePanel';
+import { EmptyPanel } from '../EmptyPanel';
+import type { PanelWithId, ColumnMeta } from '@/lib/types';
+
+export function ChartRenderer({ panel, columns, rows, truncated }: {
+  panel: PanelWithId; columns: ColumnMeta[]; rows: unknown[][]; truncated: boolean;
+}) {
+  if (rows.length === 0) return <EmptyPanel />;
+
+  const objects = toObjects(columns, rows);
+  const resolved = resolveFields(panel, columns, objects);
+
+  const needsTableFallback =
+    (['line', 'bar', 'area'].includes(panel.chartType) && (!resolved.xField || resolved.yFields.length === 0)) ||
+    (panel.chartType === 'pie' && (!resolved.labelField || !resolved.valueField)) ||
+    (panel.chartType === 'stat' && (!resolved.valueField || objects.length !== 1));
+
+  if (needsTableFallback) return <TablePanel columns={columns} rows={rows} truncated={truncated} />;
+
+  switch (panel.chartType) {
+    case 'line':
+    case 'bar':
+    case 'area': {
+      const granularity = detectDateGranularity(objects.map((o) => o[resolved.xField!]));
+      let data = objects;
+      let seriesKeys = resolved.yFields;
+      if (resolved.seriesField && resolved.yFields[0]) {
+        const pivoted = pivotLongToWide(objects, resolved.xField!, resolved.seriesField, resolved.yFields[0]);
+        data = pivoted.data;
+        seriesKeys = pivoted.seriesKeys;
+      }
+      const Comp = panel.chartType === 'line' ? LineChartPanel : panel.chartType === 'bar' ? BarChartPanel : AreaChartPanel;
+      return <Comp data={data} xField={resolved.xField!} seriesKeys={seriesKeys} unit={panel.unit} dateGranularity={granularity} />;
+    }
+    case 'pie': {
+      const { slices } = rollupPieSlices(objects, resolved.labelField!, resolved.valueField!);
+      return <PiePanel slices={slices} unit={panel.unit} />;
+    }
+    case 'stat': {
+      const value = safeNumber(objects[0][resolved.valueField!]);
+      return <StatPanel value={value} unit={panel.unit} caption={panel.comparison} />;
+    }
+    case 'table':
+    default:
+      return <TablePanel columns={columns} rows={rows} truncated={truncated} />;
+  }
+}
+```
+
+## F5. Shell components
+
+### `components/PromptBar.tsx`
+
+```tsx
+'use client';
+import { useState } from 'react';
+
+export function PromptBar({ onSubmit, disabled, defaultValue }: { onSubmit: (q: string) => void; disabled?: boolean; defaultValue?: string }) {
+  const [value, setValue] = useState(defaultValue ?? '');
+  return (
+    <form
+      className="flex w-full gap-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (value.trim()) onSubmit(value.trim());
+      }}
+    >
+      <input
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        disabled={disabled}
+        placeholder="e.g. Show me revenue by store over the last year"
+        className="w-full rounded-xl border border-gray-300 bg-white px-4 py-3 text-base text-[#0b0b0b] placeholder:text-gray-400 focus:border-[#2a78d6] focus:outline-none focus:ring-2 focus:ring-[#2a78d6]/20 disabled:opacity-60"
+      />
+      <button
+        type="submit"
+        disabled={disabled}
+        className="rounded-xl bg-[#2a78d6] px-5 py-3 text-sm font-medium text-white hover:bg-[#1c5cab] disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        Build my dashboard
+      </button>
+    </form>
+  );
+}
+```
+
