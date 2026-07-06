@@ -32,3 +32,40 @@ const NUMBER_OIDS = new Set([20, 21, 23, 700, 701, 1700]);
 const DATE_OIDS = new Set([1082, 1114, 1184]);
 const BOOLEAN_OIDS = new Set([16]);
 
+export function normalizeColumnType(oid: number): ColumnMeta["type"] {
+  if (NUMBER_OIDS.has(oid)) return "number";
+  if (DATE_OIDS.has(oid)) return "date";
+  if (BOOLEAN_OIDS.has(oid)) return "boolean";
+  return "string";
+}
+
+export interface PanelQueryResult {
+  columns: ColumnMeta[];
+  rows: unknown[][];
+  truncated: boolean;
+}
+
+const WRAP_LIMIT = 5001;
+const DISPLAY_LIMIT = 5000;
+
+export async function executePanelQuery(sanitizedSql: string): Promise<PanelQueryResult> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN TRANSACTION READ ONLY");
+    const result = await client.query({ text: wrapForExecution(sanitizedSql), rowMode: "array" });
+    await client.query("COMMIT");
+
+    const columns: ColumnMeta[] = result.fields.map((f) => ({
+      name: f.name,
+      type: normalizeColumnType(f.dataTypeID),
+    }));
+    const truncated = result.rows.length >= WRAP_LIMIT;
+    const rows = truncated ? result.rows.slice(0, DISPLAY_LIMIT) : result.rows;
+    return { columns, rows, truncated };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
