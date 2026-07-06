@@ -38,3 +38,42 @@ const cases: { name: string; input: string; expectOk: boolean; expectReason?: st
   {
     name: "7 SELECT INTO",
     input: "SELECT * INTO backup_payment FROM payment",
+    expectOk: false,
+    expectReason: "forbidden keyword: INTO",
+  },
+  {
+    name: "8 'Drop Dead Fred' documented accepted false positive",
+    input: "SELECT title FROM film WHERE title = 'Drop Dead Fred'",
+    expectOk: false,
+    expectReason: "forbidden keyword: DROP",
+  },
+];
+
+let failures = 0;
+for (const c of cases) {
+  const r = checkSql(c.input);
+  const okMatch = r.ok === c.expectOk;
+  const reasonMatch = c.expectReason === undefined || r.reason === c.expectReason;
+  if (okMatch && reasonMatch) {
+    console.log(`PASS ${c.name}`);
+  } else {
+    failures++;
+    console.error(`FAIL ${c.name}: got ok=${r.ok} reason=${JSON.stringify(r.reason)}`);
+  }
+}
+
+// Case 2 must also come back sanitized: comment stripped, no trailing semicolon.
+const c2 = checkSql(cases[1].input);
+if (
+  c2.ok &&
+  c2.sanitizedSql !== null &&
+  !c2.sanitizedSql.includes("--") &&
+  !c2.sanitizedSql.trimEnd().endsWith(";")
+) {
+  console.log("PASS 2b sanitizedSql stripped comment and semicolon");
+} else {
+  failures++;
+  console.error("FAIL 2b sanitizedSql:", JSON.stringify(c2));
+}
+
+process.exit(failures ? 1 : 0);
