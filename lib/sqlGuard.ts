@@ -30,3 +30,36 @@ export function checkSql(rawSql: string): SqlGuardResult {
   // 2. Trim.
   sql = sql.trim();
 
+  // 3. Empty after stripping?
+  if (sql.length === 0) {
+    return { ok: false, reason: "query is empty after removing comments", sanitizedSql: null };
+  }
+
+  // 4. Strip exactly one trailing semicolon, then reject if any remain
+  // (runs before the keyword scan so `SELECT 1; DROP ...` dies here).
+  sql = sql.replace(/;\s*$/, "").trimEnd();
+  if (sql.includes(";")) {
+    return { ok: false, reason: "multiple SQL statements are not allowed", sanitizedSql: null };
+  }
+
+  // 5. Must start with SELECT or WITH.
+  if (!/^\s*(SELECT|WITH)\b/i.test(sql)) {
+    return { ok: false, reason: "query must start with SELECT or WITH", sanitizedSql: null };
+  }
+
+  // 6. Forbidden-keyword scan; first match wins.
+  for (const keyword of FORBIDDEN_KEYWORDS) {
+    if (new RegExp(`\\b${keyword}\\b`, "i").test(sql)) {
+      return { ok: false, reason: `forbidden keyword: ${keyword}`, sanitizedSql: null };
+    }
+  }
+
+  // 7. Pass.
+  return { ok: true, reason: null, sanitizedSql: sql };
+}
+
+// Only ever call with SQL that just passed checkSql (trailing semicolon
+// already stripped — otherwise the wrap is syntactically invalid).
+export function wrapForExecution(sanitizedSql: string): string {
+  return `SELECT * FROM (\n${sanitizedSql}\n) AS _panel LIMIT 5001`;
+}
