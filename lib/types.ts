@@ -45,3 +45,49 @@ export type DashboardSpecWithIds = {
   panels: PanelWithId[];
 };
 
+// Repair call structured output
+export const RepairSqlSchema = z.object({ sql: z.string() });
+
+// ---- API request bodies ----
+export const DashboardRequestSchema = z.object({
+  question: z.string().trim().min(1).max(500),
+});
+export const PanelRequestSchema = z.object({
+  sql: z.string().trim().min(1).max(10_000),
+  chartType: ChartTypeSchema,
+});
+export const RepairRequestSchema = z.object({
+  question: z.string().trim().min(1).max(500),
+  panel: PanelSpecSchema,
+  sql: z.string().trim().min(1).max(10_000),
+  errorMessage: z.string().trim().min(1).max(2_000),
+});
+
+// ---- API response bodies ----
+export const ColumnMetaSchema = z.object({
+  name: z.string(),
+  type: z.enum(["number", "date", "boolean", "string"]),
+});
+export type ColumnMeta = z.infer<typeof ColumnMetaSchema>;
+
+export type DashboardResponse = { spec: DashboardSpecWithIds };
+export type PanelResponse = {
+  columns: ColumnMeta[];
+  rows: unknown[][];
+  truncated: boolean;
+};
+export type RepairResponse = { sql: string };
+
+// ---- Error taxonomy (shared by all three routes) ----
+export const ApiErrorCodeSchema = z.enum([
+  "invalid_request", // body failed zod validation
+  "sql_rejected",    // sqlGuard rejected the SQL
+  "llm_error",       // OpenAI call failed / unusable output
+  "query_timeout",   // statement_timeout fired (pg code 57014)
+  "query_failed",    // any other Postgres error
+  "internal_error",
+]);
+export type ApiErrorCode = z.infer<typeof ApiErrorCodeSchema>;
+export type ApiErrorBody = {
+  error: { code: ApiErrorCode; friendlyMessage: string; debug: string | null };
+};
