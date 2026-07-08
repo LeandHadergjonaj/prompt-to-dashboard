@@ -44,3 +44,53 @@ export async function POST(req: NextRequest) {
 
   const currentDate = new Date().toISOString().slice(0, 10);
 
+  let spec;
+  try {
+    spec = await generateDashboardSpec({
+      question: parsed.data.question,
+      currentDate,
+      schemaContext: SCHEMA_CONTEXT,
+    });
+  } catch (err) {
+    const debug = err instanceof Error ? err.message : String(err);
+    return errorResponse(
+      502,
+      "llm_error",
+      "The assistant is having trouble right now. Please try again in a moment.",
+      debug
+    );
+  }
+
+  // Some models fill unused nullable fields with junk strings ("/dev/null",
+  // "null", "") instead of JSON null — normalize before the frontend sees them.
+  const junk = new Set(["/dev/null", "null", "none", ""]);
+  const clean = (v: string | null) => (v !== null && junk.has(v.trim().toLowerCase()) ? null : v);
+
+  const panelsWithIds: PanelWithId[] = spec.panels
+    .filter((panel) => checkSql(panel.sql).ok)
+    .slice(0, 6)
+    .map((panel, i) => ({
+      ...panel,
+      xField: clean(panel.xField),
+      seriesField: clean(panel.seriesField),
+      labelField: clean(panel.labelField),
+      valueField: clean(panel.valueField),
+      comparison: clean(panel.comparison),
+      yFields: panel.yFields?.filter((f) => clean(f) !== null) ?? null,
+      id: `panel-${i}`,
+    }));
+
+  if (panelsWithIds.length === 0) {
+    return errorResponse(
+      502,
+      "llm_error",
+      "The assistant couldn't design a dashboard for that question. Try rephrasing it or being more specific.",
+      "model returned zero panels with guard-passing SQL"
+    );
+  }
+
+  const responseBody: DashboardResponse = {
+    spec: { title: spec.title, summary: spec.summary, panels: panelsWithIds },
+  };
+  return NextResponse.json(responseBody, { status: 200 });
+}
