@@ -144,3 +144,77 @@ export function detectDateGranularity(values: unknown[]): DateGranularity {
   return 'day';
 }
 
+// timeZone pinned to UTC deliberately: date_trunc results are UTC midnight;
+// local-zone formatting would shift the shown date back a day for negative-
+// offset users. Do not remove.
+export function formatDateTick(raw: unknown, granularity: DateGranularity): string {
+  if (granularity === 'none') return raw == null ? '' : String(raw);
+  const d = new Date(raw as string);
+  if (Number.isNaN(d.getTime())) return String(raw);
+  if (granularity === 'year') return new Intl.DateTimeFormat('en-US', { year: 'numeric', timeZone: 'UTC' }).format(d);
+  if (granularity === 'month') return new Intl.DateTimeFormat('en-US', { month: 'short', year: 'numeric', timeZone: 'UTC' }).format(d);
+  return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(d);
+}
+
+// ---------- number formatting ----------
+
+export function formatCompactNumber(n: number): string {
+  const abs = Math.abs(n);
+  const sign = n < 0 ? '-' : '';
+  if (abs >= 1_000_000_000) return `${sign}${(abs / 1_000_000_000).toFixed(1).replace(/\.0$/, '')}B`;
+  if (abs >= 1_000_000) return `${sign}${(abs / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  if (abs >= 1_000) return `${sign}${(abs / 1_000).toFixed(1).replace(/\.0$/, '')}k`;
+  return `${sign}${abs}`;
+}
+
+export function formatCurrencyFull(n: number): string {
+  return new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
+}
+
+export function formatCountFull(n: number): string {
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(n);
+}
+
+// percent values arrive already scaled 0-100 (the prompt defines unit
+// "percent" that way for the LLM).
+export function formatPercent(n: number): string {
+  return `${(Math.round(n * 10) / 10).toFixed(1)}%`;
+}
+
+export function formatUnitValue(raw: unknown, unit: Unit | null | undefined, mode: 'axis' | 'tooltip' | 'stat'): string {
+  const n = safeNumber(raw);
+  if (n === null) return '—';
+  switch (unit) {
+    case 'currency':
+      return mode === 'tooltip' || mode === 'stat' ? formatCurrencyFull(n) : `£${formatCompactNumber(n)}`;
+    case 'percent':
+      return formatPercent(n);
+    default:
+      return mode === 'tooltip' ? formatCountFull(n) : mode === 'stat' ? formatCountFull(n) : formatCompactNumber(n);
+  }
+}
+
+// ---------- palette ----------
+
+// Validated against a white surface with the dataviz palette validator: all
+// hard gates pass. Three hues (magenta/amber/aqua) fall below 3:1 text
+// contrast on white, so palette colors are used ONLY as fills/strokes — all
+// text renders in ink colors (#0b0b0b / #52514e).
+export const PALETTE = [
+  '#2a78d6', // blue
+  '#008300', // green
+  '#e87ba4', // magenta/rose
+  '#eda100', // amber
+  '#1baf7a', // aqua/teal
+  '#eb6834', // orange
+  '#4a3aa7', // violet
+  '#e34948', // red
+] as const;
+
+export function colorForSeriesIndex(i: number): string {
+  return PALETTE[i % PALETTE.length];
+}
+
+export function dashArrayForSeriesIndex(i: number): string | undefined {
+  return i < PALETTE.length ? undefined : '6 3';
+}
