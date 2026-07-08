@@ -25,3 +25,38 @@ export async function POST(req: NextRequest) {
     return errorResponse(400, "invalid_request", "That chart request wasn't valid.", parsed.error.message);
   }
 
+  const guard = checkSql(parsed.data.sql);
+  if (!guard.ok) {
+    return errorResponse(
+      400,
+      "sql_rejected",
+      "This chart's query isn't a supported read-only query and can't be run.",
+      guard.reason
+    );
+  }
+
+  try {
+    const result = await executePanelQuery(guard.sanitizedSql!);
+    const responseBody: PanelResponse = result;
+    return NextResponse.json(responseBody, { status: 200 });
+  } catch (err) {
+    const pgCode = (err as { code?: string })?.code;
+    const debug = err instanceof Error ? err.message : String(err);
+
+    if (pgCode === "57014") {
+      return errorResponse(
+        504,
+        "query_timeout",
+        "That query took too long to run and was cancelled. Try narrowing the date range or asking a simpler question.",
+        debug
+      );
+    }
+
+    return errorResponse(
+      500,
+      "query_failed",
+      "Something went wrong running that chart's query.",
+      debug
+    );
+  }
+}
