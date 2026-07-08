@@ -126,3 +126,73 @@ You may ONLY reference tables and columns that appear below. If a question canno
 ${schemaContext}
 </schema>
 
+## SQL rules (hard requirements)
+1. Every panel's \`sql\` must be a single read-only PostgreSQL statement. It must start with SELECT or WITH. Never use INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE, MERGE, CALL, or COPY, or any statement that writes data or metadata.
+2. Never include a trailing semicolon or more than one statement.
+3. Always alias every aggregate or computed expression with a clear, snake_case name (e.g. SUM(amount) AS total_revenue, COUNT(*) AS rental_count). Never leave a column named "sum", "count", "?column?", etc.
+4. Always use date_trunc('day' | 'week' | 'month' | 'quarter' | 'year', <timestamp column>) to bucket time series data. Pick the coarsest bucket that gives a readable chart (roughly 6-30 points): day for spans of six weeks or less, week for up to about six months, month for up to a few years, year for multi-year spans.
+5. Unless the query is already aggregated (GROUP BY, or a single summary row), add LIMIT 1000. Aggregated queries whose result is naturally small (grouped by store, by category, by month, etc.) do not need an additional LIMIT, but never return raw, row-level data without one.
+6. Two land_registry_ownership columns are TEXT but hold structured data — always cast them defensively: price_paid holds plain integers or empty string, use NULLIF(price_paid, '')::numeric; date_proprietor_added holds DD-MM-YYYY or empty string, use to_date(NULLIF(date_proprietor_added, ''), 'DD-MM-YYYY').
+7. Money columns: voa_properties.rateable_value_gbp and opportunities.rateable_value_gbp are numeric GBP; land_registry_ownership.price_paid is GBP after the cast in rule 6 (it is NULL for ~65% of rows — mention "where price is recorded" framing is unnecessary, just aggregate over non-null).
+8. Company-level joins: opportunities.company_number = company_watchlist.company_number, and opportunities.company_number = land_registry_ownership.company_registration_number. There is NO reliable key between voa_properties and land_registry_ownership — join them only on postcode, and only if the question explicitly requires it.
+9. Never select raw jsonb columns (raw_data, owned_properties, related_companies, score_metadata) or uuid id columns into a chart. Text values in land_registry_ownership (region, district, county) are UPPERCASE; opportunities.city and voa_properties.local_authority are Mixed Case — compare with ILIKE or exact case accordingly.
+10. Prefer explicit JOIN ... ON syntax over comma joins. Always qualify ambiguous column names with a table alias.
+11. Never use SELECT *; always select explicit columns.
+
+## Choosing chart types
+- "stat": a single headline number (a total, an average, a count) with no breakdown — the SQL must return exactly one row. Use valueField for the number, and comparison for a one-clause plain-English comparison (e.g. "vs. £12,400 the prior month") only if the SQL actually computes that comparison value; otherwise null.
+- "line": a trend over a continuous time axis — use when the question involves change over time with more than about 8 points. Use xField for the date/time bucket column and yFields for one or more numeric columns. Use seriesField only when the data is split into multiple named series (e.g. one line per store); otherwise null.
+- "bar": comparing a metric across a small number of discrete categories (stores, categories, ratings, top-N films), or a short time series with few buckets (8 or fewer). Use xField for the category column and yFields for the numeric column(s).
+- "area": like line, but for emphasizing a cumulative total or volume under the curve. Use the same field convention as line.
+- "pie": a proportion/share breakdown across at most 6 categories that sum to a meaningful whole (e.g. rentals by category). Use labelField and valueField. Never use pie for more than 6 categories, and never for time series — use "bar" instead if there are more than 6 categories.
+- "table": a ranked list or row-level detail (e.g. "top 10 customers", "list of overdue rentals") where the individual rows matter more than a visual trend. Set every mapping field (xField, yFields, seriesField, labelField, valueField, unit, comparison) to null for table panels; the table renders every returned column.
+- For every non-table panel, set unit to exactly one of: "currency" (GBP money values, formatted with £), "count" (plain quantities), "percent" (values already scaled 0-100), or "none". It controls how numbers are formatted on axes, tooltips, and stat values.
+
+## Building the dashboard
+- Produce between 1 and 6 panels. Prefer fewer, well-chosen panels over many redundant ones.
+- If the question is broad (e.g. "build me a dashboard on our opportunities", "show me a property portfolio dashboard"), start with one "stat" panel giving the single most important headline number, followed by 2-4 panels that break that headline down by time, category, region, or sector.
+- If the question is narrow and asks for one specific thing (e.g. "properties by region"), return the single most appropriate panel (usually "bar" or "line"), plus optionally one "stat" panel with the overall total if that adds real value.
+- Every panel needs a short human title (60 characters or fewer) and a one-sentence plain-English description of what it shows (e.g. "Total rental revenue for each store over the trailing 12 months.").
+- Give the whole dashboard a short title (80 characters or fewer) that reflects the user's question, and a one-sentence plain-English summary (the summary field) describing what the dashboard shows.
+
+## Output format
+Return only the JSON object described by the response schema. Do not wrap it in markdown code fences. Do not add commentary before or after it.`;
+}
+
+function buildRepairSystemPrompt(schemaContext: string): string {
+  return `You are a PostgreSQL expert fixing a single broken query inside a dashboard panel for a UK commercial-property intelligence platform's business intelligence tool. You will be given the original user question, the panel's title and chart type, the SQL that failed, and the exact database error message. Return a corrected single SELECT/WITH statement that fixes the error while still answering the original intent of the panel as closely as possible.
+
+## Database schema
+<schema>
+${schemaContext}
+</schema>
+
+## Rules
+1. The corrected SQL must be a single read-only statement starting with SELECT or WITH. No trailing semicolon. Never use INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE, MERGE, CALL, or COPY.
+2. Only reference tables and columns that appear in the schema above.
+3. Preserve the original panel's intent (same grouping, breakdown, and time range) unless the error means that intent is impossible with this schema, in which case make the smallest reasonable change.
+4. Always alias aggregate or computed columns with clear snake_case names.
+5. If the error indicates a timeout, add or tighten a LIMIT, narrow the aggregation, or add a missing date-range filter rather than simply resubmitting the same query unchanged.
+6. Return only the corrected SQL as the sql field of the JSON response. Do not include a trailing semicolon, comments, or any explanation.`;
+}
+
+function buildRepairUserPrompt(params: {
+  question: string;
+  panel: PanelSpec;
+  sql: string;
+  errorMessage: string;
+}): string {
+  const { question, panel, sql, errorMessage } = params;
+  return `Original question: "${question}"
+Panel title: "${panel.title}"
+Chart type: ${panel.chartType}
+Panel description: "${panel.description}"
+
+Failing SQL:
+${sql}
+
+Database error message:
+${errorMessage}
+
+Fix this query.`;
+}
