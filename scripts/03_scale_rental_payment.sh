@@ -32,3 +32,36 @@ for ((i=0; i<NUM_BATCHES; i++)); do
              SELECT
                timestamptz '$START_TS'
                  + (random() * extract(epoch FROM (timestamptz '$END_TS' - timestamptz '$START_TS'))) * interval '1 second'
+                 AS rd,
+               (interval '1 hour' + random() * interval '13 days') AS dur
+           ) t
+    ),
+    new_rentals AS (
+      INSERT INTO rental (rental_date, inventory_id, customer_id, return_date, staff_id, last_update)
+      SELECT
+        rd,
+        (1 + floor(random() * max_inventory))::int,
+        (1 + floor(random() * max_customer))::int,
+        CASE
+          WHEN rd + dur > timestamptz '$END_TS' THEN NULL
+          WHEN rd > (timestamptz '$END_TS' - interval '10 days') AND random() < 0.35 THEN NULL
+          ELSE rd + dur
+        END,
+        (1 + floor(random() * max_staff))::int,
+        now()
+      FROM gen
+      ON CONFLICT (rental_date, inventory_id, customer_id) DO NOTHING
+      RETURNING rental_id, rental_date, customer_id, staff_id
+    )
+    INSERT INTO payment (customer_id, staff_id, rental_id, amount, payment_date)
+    SELECT
+      customer_id,
+      staff_id,
+      rental_id,
+      round((0.99 + random() * 11.00)::numeric, 2),
+      rental_date + (interval '1 hour' * floor(random() * 71))
+    FROM new_rentals;
+  "
+done
+
+echo "Done. Verify with scripts/04_verify.sh"
