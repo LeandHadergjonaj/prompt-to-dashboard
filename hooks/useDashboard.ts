@@ -123,3 +123,53 @@ export function useDashboard() {
     [setPanel, runPanel, maybeFinish]
   );
 
+  const submit = useCallback(
+    async (question: string) => {
+      abortAll();
+      currentQuestionRef.current = question;
+      setState({ phase: 'planning', question, spec: null, panels: {}, dashboardError: null });
+
+      const controller = new AbortController();
+      dashboardControllerRef.current = controller;
+      try {
+        const res = await fetch('/api/dashboard', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question }),
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => null);
+          throw new FriendlyError(errBody?.error?.friendlyMessage ?? GENERIC_DASHBOARD_ERROR);
+        }
+        const { spec } = (await res.json()) as { spec: DashboardSpecWithIds };
+
+        const initialPanels: Record<string, PanelState> = {};
+        for (const p of spec.panels) initialPanels[p.id] = { status: 'loading', sql: p.sql };
+        setState({ phase: 'rendering', question, spec, panels: initialPanels, dashboardError: null });
+
+        for (const p of spec.panels) {
+          const panelController = new AbortController();
+          panelControllersRef.current.set(p.id, panelController);
+          runPanel(p, panelController.signal); // fire-and-forget: panels settle independently
+        }
+      } catch (err) {
+        if ((err as { name?: string }).name === 'AbortError') return;
+        setState({
+          phase: 'error', question, spec: null, panels: {},
+          dashboardError: err instanceof FriendlyError ? err.message : GENERIC_DASHBOARD_ERROR,
+        });
+      }
+    },
+    [abortAll, runPanel]
+  );
+
+  const reset = useCallback(() => {
+    abortAll();
+    setState({ phase: 'idle', question: '', spec: null, panels: {}, dashboardError: null });
+  }, [abortAll]);
+
+  const retry = useCallback(() => submit(currentQuestionRef.current), [submit]);
+
+  return { ...state, submit, reset, retry };
+}
