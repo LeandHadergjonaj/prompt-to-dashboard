@@ -59,3 +59,68 @@ async function main() {
        WHERE tc.constraint_type='FOREIGN KEY' AND tc.table_schema='public' AND tc.table_name=$1;`, [table_name]
     );
 
+    const statsRes = await client.query(
+      `SELECT GREATEST(c.reltuples::bigint, s.n_live_tup)::bigint AS n
+       FROM pg_class c
+       JOIN pg_namespace ns ON ns.oid = c.relnamespace
+       LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+       WHERE ns.nspname='public' AND c.relname=$1;`, [table_name]
+    );
+    const approx = statsRes.rows[0]?.n ?? 0;
+
+    md += `### ${table_name}\n\n`;
+    md += `- Approximate row count: ${approx}\n`;
+    md += `- Primary key: (${pk.rows.map(r => r.column_name).join(', ') || 'none'})\n\n`;
+    md += `| Column | Type | Nullable |\n|---|---|---|\n`;
+    for (const c of cols.rows) {
+      md += `| ${c.column_name} | ${c.data_type} | ${c.is_nullable} |\n`;
+    }
+    if (fks.rows.length) {
+      md += `\nForeign keys:\n`;
+      for (const fk of fks.rows) md += `- ${fk.fk_column} -> ${fk.ref_table}(${fk.ref_column})\n`;
+    }
+    md += `\n`;
+
+    for (const c of cols.rows) {
+      const name = c.column_name;
+      const type = c.data_type;
+
+      if (type === 'date' || type.startsWith('timestamp')) {
+        const r = await client.query(
+          `SELECT min(${quoteIdent(name)})::text AS lo, max(${quoteIdent(name)})::text AS hi FROM ${quoteIdent(table_name)};`
+        );
+        if (r.rows[0]?.lo) {
+          valueNotes += `- ${table_name}.${name}: ranges ${r.rows[0].lo} .. ${r.rows[0].hi}\n`;
+        }
+        continue;
+      }
+
+      if ((type === 'text' || type === 'boolean' || type === 'character varying') && !SKIP_VALUE_COLUMNS.test(name)) {
+        const r = await client.query(
+          `SELECT ${quoteIdent(name)}::text AS v, count(*) AS n
+           FROM ${quoteIdent(table_name)}
+           WHERE ${quoteIdent(name)} IS NOT NULL
+           GROUP BY 1 ORDER BY n DESC LIMIT ${MAX_ENUM_VALUES + 1};`
+        );
+        if (r.rows.length === 0) continue;
+        if (r.rows.length <= MAX_ENUM_VALUES) {
+          valueNotes += `- ${table_name}.${name} (all values): ${r.rows.map(x => JSON.stringify(x.v)).join(', ')}\n`;
+        } else {
+          valueNotes += `- ${table_name}.${name} (high cardinality; most common): ${r.rows.slice(0, TOP_SAMPLE).map(x => JSON.stringify(x.v)).join(', ')}, ...\n`;
+        }
+      }
+    }
+  }
+
+  md += `## Column value reference\n\nDistinct values for low-cardinality columns, top values for high-cardinality ones, and date ranges:\n\n${valueNotes}`;
+
+  writeFileSync('db/schema-context.md', md);
+  await client.end();
+  console.log('Wrote db/schema-context.md');
+}
+
+function quoteIdent(s) {
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+main().catch(e => { console.error(e); process.exit(1); });
