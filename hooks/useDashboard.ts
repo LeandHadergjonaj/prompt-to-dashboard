@@ -53,3 +53,73 @@ export function useDashboard() {
     setState((s) => ({ ...s, panels: { ...s.panels, [id]: { ...s.panels[id], ...patch } as PanelState } }));
   }, []);
 
+  const maybeFinish = useCallback(() => {
+    setState((s) => {
+      const allSettled = Object.values(s.panels).every((p) => p.status === 'ready' || p.status === 'failed');
+      if (allSettled && s.phase === 'rendering') return { ...s, phase: 'done' };
+      return s;
+    });
+  }, []);
+
+  const runPanel = useCallback(
+    async (panel: PanelWithId, signal: AbortSignal, sqlOverride?: string, isRepairRun = false) => {
+      const sql = sqlOverride ?? panel.sql;
+      setPanel(panel.id, { status: isRepairRun ? 'repairing' : 'loading', sql });
+      try {
+        const res = await fetch('/api/panel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sql, chartType: panel.chartType }),
+          signal,
+        });
+        const body = await res.json().catch(() => null);
+        if (res.ok && body && !body.error) {
+          setPanel(panel.id, { status: 'ready', columns: body.columns, rows: body.rows, truncated: body.truncated });
+          maybeFinish();
+          return;
+        }
+        const errBody: ApiErrorShape | undefined = body?.error;
+        const friendlyMessage = errBody?.friendlyMessage ?? GENERIC_PANEL_ERROR;
+        if (isRepairRun) {
+          setPanel(panel.id, { status: 'failed', error: { friendlyMessage, debug: errBody?.debug } });
+          maybeFinish();
+          return;
+        }
+        // Raw DB error lives in debug — that's what the repair prompt needs.
+        const rawError = (errBody?.debug ?? errBody?.friendlyMessage ?? 'unknown error').slice(0, 2000);
+        await attemptRepair(panel, signal, sql, rawError);
+      } catch (err) {
+        if ((err as { name?: string }).name === 'AbortError') return;
+        if (isRepairRun) {
+          setPanel(panel.id, { status: 'failed', error: { friendlyMessage: GENERIC_PANEL_ERROR } });
+          maybeFinish();
+          return;
+        }
+        await attemptRepair(panel, signal, sql, 'network error');
+      }
+    },
+    [setPanel, maybeFinish] // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  const attemptRepair = useCallback(
+    async (panel: PanelWithId, signal: AbortSignal, sql: string, errorMessage: string) => {
+      setPanel(panel.id, { status: 'repairing' });
+      try {
+        const res = await fetch('/api/repair', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: currentQuestionRef.current, panel, sql, errorMessage }),
+          signal,
+        });
+        if (!res.ok) throw new Error('repair failed');
+        const { sql: repairedSql } = await res.json();
+        await runPanel(panel, signal, repairedSql, true);
+      } catch (err) {
+        if ((err as { name?: string }).name === 'AbortError') return;
+        setPanel(panel.id, { status: 'failed', error: { friendlyMessage: GENERIC_PANEL_ERROR } });
+        maybeFinish();
+      }
+    },
+    [setPanel, runPanel, maybeFinish]
+  );
+
