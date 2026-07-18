@@ -6,10 +6,10 @@ import { ExampleChips } from '@/components/ExampleChips';
 import { DashboardView } from '@/components/DashboardView';
 
 const EXAMPLES = [
-  'Which regions have the most company-owned properties?',
-  'Build me a dashboard on our opportunities pipeline',
-  'Top 10 local authorities by total rateable value',
-  'How do opportunity signals break down by sector?',
+  'Give me an overview dashboard of this database',
+  'What are the biggest categories by total value?',
+  'Show me activity over the last 12 months',
+  'Which records were added most recently?',
 ];
 
 export default function Page() {
@@ -25,7 +25,7 @@ export default function Page() {
       <div className="mx-auto flex max-w-2xl flex-col items-center gap-6 px-4 pt-24 text-center">
         <div>
           <h1 className="text-3xl font-semibold text-[#0b0b0b]">Ask for a dashboard in plain English.</h1>
-          <p className="mt-2 text-base text-[#52514e]">No SQL, no setup — just tell us what you want to see about your property data.</p>
+          <p className="mt-2 text-base text-[#52514e]">No SQL, no setup — just ask questions about whatever database this app is connected to.</p>
         </div>
         <PromptBar onSubmit={submit} disabled={phase === 'planning'} defaultValue={question} />
         {phase === 'idle' && <ExampleChips examples={EXAMPLES} onSelect={submit} />}

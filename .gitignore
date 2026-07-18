@@ -30,8 +30,9 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files (the example template is the one env file meant to be committed)
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -40,5 +41,5 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# downloaded pagila artifacts (re-fetch with scripts/01_fetch_pagila.sh)
-db/vendor/
+# generated locally from your database (schema + sampled values) — never commit
+db/schema-context.md

@@ -1,4 +1,4 @@
-# Contributing to text-to-sql
+# Contributing to prompt-to-dashboard
 
 Thanks for your interest in improving this project. This document covers everything you need to
 get set up, the conventions the codebase follows, and how to submit a change.
@@ -8,8 +8,8 @@ get set up, the conventions the codebase follows, and how to submit a change.
 1. Fork the repo and clone your fork.
 2. `npm install`
 3. `cp .env.example .env.local` and fill in `DATABASE_URL_READONLY` + `OPENAI_API_KEY` (see the
-   [README](README.md#configuration) for details on both, including how to generate
-   `db/schema-context.md` for your own database).
+   [README](README.md#configuration) for details on both), then `npm run introspect` to generate
+   the schema context for your database.
 4. `npm run dev` and confirm the app loads at `http://localhost:3000`.
 
 ## Before you open a PR
@@ -20,23 +20,22 @@ get set up, the conventions the codebase follows, and how to submit a change.
 - **Run a production build**: `npm run build`. This also runs `next lint` and the TypeScript
   compiler; both must be clean.
 - **Manually exercise the change** in the browser — type a question through the real UI, not just
-  the API routes in isolation. See the manual QA checklist in `PLAN.md` (§F9) for the flows worth
-  covering (loading states, panel failures/repairs, `?debug=1`, responsive layout).
+  the API routes in isolation. Flows worth covering: loading states, a panel whose SQL fails (and
+  its one-shot repair), the `?debug=1` error surface, and responsive layout.
 
 ## Conventions
 
 - **TypeScript, strict mode.** No `any` without a specific reason left as a comment.
 - **Zod is the source of truth** for shared types (`lib/types.ts`) — add new fields there first,
   derive types with `z.infer`, and keep OpenAI's structured-output schema in sync (all fields must
-  stay `required`, non-applicable ones `nullable`, per the OpenAI strict-mode constraints documented
-  in `PLAN.md`).
+  stay `required`, non-applicable ones `nullable`, per OpenAI's strict-mode constraints).
 - **No comments explaining *what* code does** — name things so the code reads on its own. Comments
   are reserved for non-obvious *why* (a workaround, an external constraint, a subtle invariant).
 - **Commit messages**: short, imperative, conventional-style prefixes where useful (`feat:`, `fix:`,
   `docs:`, `test:`, `chore:`). Explain *why* in the body when the reasoning isn't obvious from the
   diff.
-- **Safety-critical code** (`lib/sqlGuard.ts`, `lib/db.ts`, `db/04_dashboard_reader_role.sql` /
-  `db/05_dashboard_reader_existing_data.sql`) should never be relaxed to "fix" a failing query.
+- **Safety-critical code** (`lib/sqlGuard.ts`, `lib/db.ts`, `db/readonly_role.sql`) should never
+  be relaxed to "fix" a failing query.
   Fix the prompt or the schema context instead — see [SECURITY.md](SECURITY.md) for why this
   boundary matters.
 

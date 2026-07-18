@@ -15,7 +15,7 @@ export function PromptBar({ onSubmit, disabled, defaultValue }: { onSubmit: (q: 
         value={value}
         onChange={(e) => setValue(e.target.value)}
         disabled={disabled}
-        placeholder="e.g. Which regions have the most company-owned properties?"
+        placeholder="e.g. Show me revenue by month for the last year"
         className="w-full rounded-xl border border-gray-300 bg-white px-4 py-3 text-base text-[#0b0b0b] placeholder:text-gray-400 focus:border-[#2a78d6] focus:outline-none focus:ring-2 focus:ring-[#2a78d6]/20 disabled:opacity-60"
       />
       <button

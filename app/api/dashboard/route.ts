@@ -1,6 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import fs from "node:fs";
-import path from "node:path";
 import {
   DashboardRequestSchema,
   type ApiErrorBody,
@@ -9,11 +7,7 @@ import {
 } from "@/lib/types";
 import { generateDashboardSpec } from "@/lib/openai";
 import { checkSql } from "@/lib/sqlGuard";
-
-const SCHEMA_CONTEXT = fs.readFileSync(
-  path.join(process.cwd(), "db", "schema-context.md"),
-  "utf-8"
-);
+import { getSchemaContext } from "@/lib/schemaContext";
 
 function errorResponse(
   status: number,
@@ -44,12 +38,24 @@ export async function POST(req: NextRequest) {
 
   const currentDate = new Date().toISOString().slice(0, 10);
 
+  let schemaContext: string;
+  try {
+    schemaContext = getSchemaContext();
+  } catch (err) {
+    return errorResponse(
+      500,
+      "internal_error",
+      "This app isn't connected to a database schema yet. Ask whoever runs it to generate the schema context.",
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+
   let spec;
   try {
     spec = await generateDashboardSpec({
       question: parsed.data.question,
       currentDate,
-      schemaContext: SCHEMA_CONTEXT,
+      schemaContext,
     });
   } catch (err) {
     const debug = err instanceof Error ? err.message : String(err);

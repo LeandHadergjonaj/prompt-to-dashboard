@@ -1,35 +1,41 @@
 #!/usr/bin/env node
 // Generic schema introspector: writes db/schema-context.md for the LLM prompt.
+// Works against any PostgreSQL-compatible database.
 // Run: DATABASE_URL=... node scripts/introspect-schema.mjs
+// TLS comes from the connection string's sslmode parameter
+// (disable | require | no-verify | verify-full).
 import { Client } from 'pg';
 import { writeFileSync } from 'node:fs';
 
-// Strip sslmode from the URL: it would override the ssl object below and
-// force full chain verification, which fails on Supabase's pooler cert.
-const connectionString = (process.env.DATABASE_URL ?? '')
-  .replace(/([?&])sslmode=[^&]*&?/, '$1')
-  .replace(/[?&]$/, '');
+const connectionString = process.env.DATABASE_URL ?? process.env.DATABASE_URL_READONLY;
+if (!connectionString) {
+  console.error(
+    'Set DATABASE_URL (or DATABASE_URL_READONLY) to a Postgres connection string, e.g.\n' +
+      '  DATABASE_URL=postgresql://user:pass@host:5432/db node scripts/introspect-schema.mjs'
+  );
+  process.exit(1);
+}
 
-const client = new Client({
-  connectionString,
-  ssl: { rejectUnauthorized: false },
-});
+const client = new Client({ connectionString });
 
 // Columns worth enumerating values for: text/boolean, excluding ids,
 // free-text and identifier-ish names (kept out to keep the prompt compact).
 const SKIP_VALUE_COLUMNS =
-  /(^id$|_id$|_ids$|number|address|postcode|reference|uarn|rationale|_text$|^raw|name$|_by$|_to$|scat_code|title)/i;
+  /(^id$|_id$|_ids$|number|address|postcode|reference|_text$|^raw|name$|_by$|_to$|title)/i;
 const MAX_ENUM_VALUES = 24;
 const TOP_SAMPLE = 10;
 
 async function main() {
   await client.connect();
 
+  // pg_class (not information_schema) so child partitions are excluded
+  // generically: partitioned parents ('p') are listed, their partitions not.
   const { rows: tables } = await client.query(
-    `SELECT table_name FROM information_schema.tables
-     WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-       AND table_name NOT LIKE 'payment\\_p%'
-     ORDER BY table_name;`
+    `SELECT c.relname AS table_name
+     FROM pg_class c
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+     ORDER BY c.relname;`
   );
 
   let md = `# Schema Context\n\nGenerated: ${new Date().toISOString()}\n\n## Tables\n\n`;

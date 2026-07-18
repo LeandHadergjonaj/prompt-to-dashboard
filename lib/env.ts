@@ -8,10 +8,11 @@ const DEFAULT_OPENAI_MODEL = "gpt-5.6-terra";
 
 const HELP_TEXT: Record<string, string> = {
   DATABASE_URL_READONLY:
-    "Supabase dashboard -> Project Settings -> Database -> Connection string -> " +
-    "Session pooler. Use the credentials for the read-only `dashboard_reader` " +
-    "role (NOT the default postgres role). Format: " +
-    "postgresql://dashboard_reader.<project-ref>:<password>@<pooler-host>:5432/postgres",
+    "Connection string for a READ-ONLY role on your PostgreSQL-compatible " +
+    "database (create one with db/readonly_role.sql — never point this at an " +
+    "admin role). Format: postgresql://dashboard_reader:<password>@<host>:5432/<database>. " +
+    "TLS is controlled by the URL's sslmode parameter (sslmode=no-verify for " +
+    "providers whose certificate chain can't be fully verified).",
   OPENAI_API_KEY:
     "Create one at https://platform.openai.com/api-keys " +
     "(requires an OpenAI account with billing enabled).",

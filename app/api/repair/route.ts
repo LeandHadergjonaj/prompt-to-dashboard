@@ -1,6 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import fs from "node:fs";
-import path from "node:path";
 import {
   RepairRequestSchema,
   type ApiErrorBody,
@@ -8,11 +6,7 @@ import {
 } from "@/lib/types";
 import { repairSql } from "@/lib/openai";
 import { checkSql } from "@/lib/sqlGuard";
-
-const SCHEMA_CONTEXT = fs.readFileSync(
-  path.join(process.cwd(), "db", "schema-context.md"),
-  "utf-8"
-);
+import { getSchemaContext } from "@/lib/schemaContext";
 
 function errorResponse(
   status: number,
@@ -36,6 +30,18 @@ export async function POST(req: NextRequest) {
     return errorResponse(400, "invalid_request", "That repair request wasn't valid.", parsed.error.message);
   }
 
+  let schemaContext: string;
+  try {
+    schemaContext = getSchemaContext();
+  } catch (err) {
+    return errorResponse(
+      500,
+      "internal_error",
+      "This app isn't connected to a database schema yet. Ask whoever runs it to generate the schema context.",
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+
   let repairedSql: string;
   try {
     repairedSql = await repairSql({
@@ -43,7 +49,7 @@ export async function POST(req: NextRequest) {
       panel: parsed.data.panel,
       sql: parsed.data.sql,
       errorMessage: parsed.data.errorMessage,
-      schemaContext: SCHEMA_CONTEXT,
+      schemaContext,
     });
   } catch (err) {
     const debug = err instanceof Error ? err.message : String(err);

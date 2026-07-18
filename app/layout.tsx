@@ -1,6 +1,6 @@
 import './globals.css';
 
-export const metadata = { title: 'Dashboard Builder', description: 'Ask for a dashboard in plain English.' };
+export const metadata = { title: 'Prompt to Dashboard', description: 'Ask for a dashboard in plain English.' };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (

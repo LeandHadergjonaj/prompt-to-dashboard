@@ -13,19 +13,14 @@ types.setTypeParser(1184, (v: string) => {
   return iso.endsWith("+00") ? iso.slice(0, -3) + "Z" : iso;
 });
 
-// Strip sslmode from the URL: it would override the ssl object below and
-// force full chain verification, which fails on Supabase's pooler cert.
-const connectionString = env.DATABASE_URL_READONLY
-  .replace(/([?&])sslmode=[^&]*&?/, "$1")
-  .replace(/[?&]$/, "");
-
+// TLS comes from the connection string's sslmode parameter
+// (disable | require | no-verify | verify-full).
 export const pool = new Pool({
-  connectionString,
+  connectionString: env.DATABASE_URL_READONLY,
   max: 5,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
   statement_timeout: 19_000, // just under the role's 20s backstop
-  ssl: { rejectUnauthorized: false },
 });
 
 const NUMBER_OIDS = new Set([20, 21, 23, 700, 701, 1700]);

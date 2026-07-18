@@ -1,5 +1,21 @@
 import type { PanelWithId, ColumnMeta, Unit } from './types';
 
+// Display locale/currency are deploy-time configuration (NEXT_PUBLIC_* vars
+// are inlined at build). The LLM's `unit: "currency"` contract is unchanged.
+const LOCALE = process.env.NEXT_PUBLIC_LOCALE || 'en-US';
+const CURRENCY = process.env.NEXT_PUBLIC_CURRENCY || 'USD';
+const CURRENCY_SYMBOL = (() => {
+  try {
+    return (
+      new Intl.NumberFormat(LOCALE, { style: 'currency', currency: CURRENCY })
+        .formatToParts(0)
+        .find((p) => p.type === 'currency')?.value ?? CURRENCY
+    );
+  } catch {
+    return CURRENCY;
+  }
+})();
+
 // ---------- guards ----------
 
 export function safeNumber(raw: unknown): number | null {
@@ -151,9 +167,9 @@ export function formatDateTick(raw: unknown, granularity: DateGranularity): stri
   if (granularity === 'none') return raw == null ? '' : String(raw);
   const d = new Date(raw as string);
   if (Number.isNaN(d.getTime())) return String(raw);
-  if (granularity === 'year') return new Intl.DateTimeFormat('en-US', { year: 'numeric', timeZone: 'UTC' }).format(d);
-  if (granularity === 'month') return new Intl.DateTimeFormat('en-US', { month: 'short', year: 'numeric', timeZone: 'UTC' }).format(d);
-  return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(d);
+  if (granularity === 'year') return new Intl.DateTimeFormat(LOCALE, { year: 'numeric', timeZone: 'UTC' }).format(d);
+  if (granularity === 'month') return new Intl.DateTimeFormat(LOCALE, { month: 'short', year: 'numeric', timeZone: 'UTC' }).format(d);
+  return new Intl.DateTimeFormat(LOCALE, { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(d);
 }
 
 // ---------- number formatting ----------
@@ -168,11 +184,11 @@ export function formatCompactNumber(n: number): string {
 }
 
 export function formatCurrencyFull(n: number): string {
-  return new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
+  return new Intl.NumberFormat(LOCALE, { style: 'currency', currency: CURRENCY, minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
 }
 
 export function formatCountFull(n: number): string {
-  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(n);
+  return new Intl.NumberFormat(LOCALE, { maximumFractionDigits: 2 }).format(n);
 }
 
 // percent values arrive already scaled 0-100 (the prompt defines unit
@@ -186,7 +202,7 @@ export function formatUnitValue(raw: unknown, unit: Unit | null | undefined, mod
   if (n === null) return '—';
   switch (unit) {
     case 'currency':
-      return mode === 'tooltip' || mode === 'stat' ? formatCurrencyFull(n) : `£${formatCompactNumber(n)}`;
+      return mode === 'tooltip' || mode === 'stat' ? formatCurrencyFull(n) : `${CURRENCY_SYMBOL}${formatCompactNumber(n)}`;
     case 'percent':
       return formatPercent(n);
     default:

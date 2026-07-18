@@ -1,15 +1,16 @@
 {
-  "name": "text-to-sql",
+  "name": "prompt-to-dashboard",
   "version": "0.1.0",
-  "description": "Text-to-dashboard agent: ask a plain-English question, get a live dashboard backed by a safety-guarded, LLM-generated SQL pipeline.",
+  "description": "Embeddable AI dashboard engine: plain-English questions become live, safety-guarded dashboards on top of your own PostgreSQL database.",
   "keywords": [
     "text-to-sql",
+    "text-to-dashboard",
+    "embedded-analytics",
     "llm",
     "dashboard",
     "openai",
     "nextjs",
     "postgres",
-    "supabase",
     "recharts",
     "data-visualization"
   ],
@@ -32,6 +33,7 @@
     "build": "next build --turbopack",
     "start": "next start",
     "lint": "eslint",
+    "introspect": "node scripts/introspect-schema.mjs",
     "test:sqlguard": "tsx scripts/test-sqlguard.ts"
   },
   "dependencies": {

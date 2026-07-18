@@ -16,7 +16,7 @@
 - [ ] If `lib/sqlGuard.ts` changed: `npx tsx scripts/test-sqlguard.ts` passes
 - [ ] Manually exercised the change in the browser (not just the API in isolation)
 - [ ] Updated `CHANGELOG.md` under `[Unreleased]` if user-facing
-- [ ] Updated `README.md` / `PLAN.md` if this changes documented behavior
+- [ ] Updated `README.md` if this changes documented behavior
 
 ## Screenshots (if UI-related)
 

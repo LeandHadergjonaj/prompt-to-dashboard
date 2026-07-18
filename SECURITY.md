@@ -23,9 +23,8 @@ priority:
   payload, or a forbidden keyword being executed.
 - **`lib/db.ts`** — anything that would let a query escape the `READ ONLY` transaction or the
   `LIMIT 5001` wrapper.
-- **`db/04_dashboard_reader_role.sql` / `db/05_dashboard_reader_existing_data.sql`** — the
-  `dashboard_reader` Postgres role's grants. If you can find a way for this role to `INSERT`,
-  `UPDATE`, `DELETE`, or run DDL, that's a critical finding.
+- **`db/readonly_role.sql`** — the `dashboard_reader` Postgres role's grants. If you can find a
+  way for this role to `INSERT`, `UPDATE`, `DELETE`, or run DDL, that's a critical finding.
 - **Prompt injection** — a natural-language question crafted to make the LLM emit SQL that, while
   syntactically a `SELECT`, exfiltrates data outside the intended schema or abuses the read-only
   role's remaining permissions in an unintended way.
