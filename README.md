@@ -34,6 +34,8 @@ which is the part designed to be embedded.
 **Highlights**
 
 - 🧠 **LLM-designed dashboards** — one structured-output call turns a question into a 1–6 panel spec (chart type, fields, SQL) using the OpenAI Responses API.
+- 💬 **Conversational follow-ups** — "make this a pie chart", "add revenue by country", "only 2024": each request carries the conversation history, the model decides whether to update the dashboard on screen or start a new one, and unchanged panels reuse cached results without re-querying.
+- ⬇️ **Downloadable output** — the whole dashboard as a PNG image or a JSON export (spec + queries + data), and per-panel CSVs.
 - 🛡️ **Defense-in-depth SQL safety** — a dedicated read-only Postgres role, read-only transactions, an application-level SQL guard, and a hard row cap make destructive queries structurally impossible, not just discouraged.
 - 🔧 **Self-healing queries** — if a generated query fails, the agent gets one automatic shot at repairing it before the user ever sees an error.
 - 📊 **Six chart types** — line, bar, area, pie, stat, and table, rendered with Recharts and a graceful fallback to a table when a spec doesn't match the returned columns.
@@ -174,19 +176,25 @@ npm run build && npm run start   # production build
 │   └── page.tsx                 # dashboard UI shell / view state machine
 ├── components/
 │   ├── charts/                  # one component per chart type + dispatcher
-│   └── *.tsx                    # prompt bar, dashboard grid, panel card, error/empty states
+│   └── *.tsx                    # prompt bar, dashboard grid, panel card, download menu, error/empty states
 ├── hooks/
-│   └── useDashboard.ts          # fetch orchestration, per-panel state, repair retries
+│   └── useDashboard.ts          # fetch orchestration, conversation history, per-panel state, repair retries
 ├── lib/                         # the engine
 │   ├── env.ts                   # fail-fast environment validation
 │   ├── types.ts                 # Zod schemas: single source of truth for types + LLM JSON schema
 │   ├── schemaContext.ts         # lazy loader for the generated schema context
 │   ├── sqlGuard.ts              # SQL safety guard (see Safety model)
 │   ├── db.ts                    # read-only pool + panel query execution
+│   ├── download.ts              # client-side CSV/JSON/PNG export helpers
 │   └── openai.ts                # OpenAI client, prompts, dashboard/repair generation
 ├── db/
 │   ├── readonly_role.sql        # generic read-only role setup
 │   └── schema-context.md        # generated locally per deployment (gitignored)
+├── skills/                      # gathered, sourced knowledge on doing this work well
+│   ├── dashboard-design/        # chart choice, composition, design rules
+│   ├── analytical-sql/          # Postgres correctness, patterns, style, performance
+│   ├── text-to-sql/             # LLM SQL generation techniques and guardrails
+│   └── conversational-analytics/# multi-turn follow-up design
 └── scripts/
     ├── introspect-schema.mjs    # generates db/schema-context.md from any Postgres DB
     └── test-sqlguard.ts         # sqlGuard unit test cases
@@ -201,16 +209,29 @@ is safe to show a user; `debug` carries the raw error and is only surfaced in th
 <summary><code>POST /api/dashboard</code></summary>
 
 ```jsonc
-// Request
-{ "question": "revenue by month over the last year" }
+// Request — `history` is optional; omit it for single-shot use.
+// Each turn is a compact record of a prior request and the dashboard it produced.
+{
+  "question": "make this a pie chart",
+  "history": [
+    {
+      "question": "orders by region",
+      "dashboardTitle": "Orders by Region",
+      "panels": [{ "title": "...", "chartType": "bar", "sql": "SELECT ..." }]
+    }
+  ]
+}
 
-// Response 200
+// Response 200 — `mode` is "update" when the spec refines the previous turn's
+// dashboard (unchanged panels keep their SQL verbatim so the client can reuse
+// cached results), "new" for a fresh dashboard. Always "new" without history.
 {
   "spec": {
-    "title": "Revenue by Month",
-    "summary": "Total revenue per month over the trailing 12 months.",
+    "mode": "update",
+    "title": "Orders by Region",
+    "summary": "Share of orders per region.",
     "panels": [
-      { "id": "panel-0", "title": "...", "chartType": "bar", "sql": "SELECT ...", "xField": "...", "yFields": ["..."], "unit": "currency", "...": "..." }
+      { "id": "panel-0", "title": "...", "chartType": "pie", "sql": "SELECT ...", "labelField": "...", "valueField": "...", "unit": "count", "...": "..." }
     ]
   }
 }
