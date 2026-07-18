@@ -22,3 +22,28 @@ export function AreaChartPanel({ data, xField, seriesKeys, unit, dateGranularity
           tick={{ fontSize: 12, fill: '#898781' }}
           axisLine={{ stroke: '#c3c2b7' }}
           tickLine={false}
+          minTickGap={24}
+        />
+        <YAxis
+          tickFormatter={(v) => formatUnitValue(v, unit, 'axis')}
+          tick={{ fontSize: 12, fill: '#898781' }}
+          axisLine={{ stroke: '#c3c2b7' }}
+          tickLine={false}
+          width={56}
+        />
+        <Tooltip
+          formatter={(value, name) => [formatUnitValue(value, unit, 'tooltip'), String(name)]}
+          labelFormatter={(label) => formatDateTick(label, dateGranularity)}
+          contentStyle={{ borderRadius: 8, border: '1px solid rgba(11,11,11,0.10)', fontSize: 12 }}
+        />
+        {seriesKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 12 }} />}
+        {seriesKeys.map((key, i) => (
+          <Area key={key} type="monotone" dataKey={key} name={key}
+                stroke={colorForSeriesIndex(i)} strokeWidth={2}
+                fill={colorForSeriesIndex(i)} fillOpacity={0.1}
+                isAnimationActive={false} connectNulls />
+        ))}
+      </AreaChart>
+    </ResponsiveContainer>
+  );
+}
