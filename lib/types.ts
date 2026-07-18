@@ -28,7 +28,14 @@ export const PanelSpecSchema = z.object({
 });
 export type PanelSpec = z.infer<typeof PanelSpecSchema>;
 
+// "update" = this turn refines/extends the dashboard from the previous turn
+// (unchanged panels keep their SQL verbatim so results can be reused);
+// "new" = a fresh dashboard unrelated to what came before.
+export const DashboardModeSchema = z.enum(["new", "update"]);
+export type DashboardMode = z.infer<typeof DashboardModeSchema>;
+
 export const DashboardSpecSchema = z.object({
+  mode: DashboardModeSchema,
   title: z.string(),
   summary: z.string(), // one plain-English sentence shown under the dashboard title
   panels: z.array(PanelSpecSchema), // 1-6 cap enforced in route code, not schema
@@ -40,6 +47,7 @@ export type DashboardSpec = z.infer<typeof DashboardSpecSchema>;
 // per-panel state on them.
 export type PanelWithId = PanelSpec & { id: string };
 export type DashboardSpecWithIds = {
+  mode: DashboardMode;
   title: string;
   summary: string;
   panels: PanelWithId[];
@@ -48,9 +56,31 @@ export type DashboardSpecWithIds = {
 // Repair call structured output
 export const RepairSqlSchema = z.object({ sql: z.string() });
 
+// ---- Conversation history (client -> /api/dashboard) ----
+// A compact record of each prior turn: what the user asked and what dashboard
+// came back. SQL is included so the model can carry unchanged panels over
+// verbatim (and the client can then reuse cached results).
+export const HistoryPanelSchema = z.object({
+  title: z.string().max(200),
+  chartType: ChartTypeSchema,
+  sql: z.string().max(10_000),
+});
+export type HistoryPanel = z.infer<typeof HistoryPanelSchema>;
+
+export const HistoryTurnSchema = z.object({
+  question: z.string().trim().min(1).max(500),
+  dashboardTitle: z.string().max(200),
+  panels: z.array(HistoryPanelSchema).max(6),
+});
+export type HistoryTurn = z.infer<typeof HistoryTurnSchema>;
+
+export const MAX_HISTORY_TURNS = 8;
+
 // ---- API request bodies ----
+// `history` defaults to [] so pre-existing single-shot clients keep working.
 export const DashboardRequestSchema = z.object({
   question: z.string().trim().min(1).max(500),
+  history: z.array(HistoryTurnSchema).max(MAX_HISTORY_TURNS).default([]),
 });
 export const PanelRequestSchema = z.object({
   sql: z.string().trim().min(1).max(10_000),
