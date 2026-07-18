@@ -32,3 +32,37 @@ export default function Page() {
         {phase === 'planning' && (
           <div role="status" aria-live="polite" aria-busy="true" className="flex items-center justify-center gap-2 py-10">
             <span className="flex gap-1">
+              <span className="h-2 w-2 animate-bounce rounded-full bg-[#2a78d6] [animation-delay:-0.3s]" />
+              <span className="h-2 w-2 animate-bounce rounded-full bg-[#2a78d6] [animation-delay:-0.15s]" />
+              <span className="h-2 w-2 animate-bounce rounded-full bg-[#2a78d6]" />
+            </span>
+            <span className="text-sm text-[#52514e]">Designing your dashboard…</span>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (phase === 'error') {
+    return (
+      <div className="mx-auto max-w-2xl px-4 py-6">
+        <PromptBar onSubmit={submit} />
+        <div className="mx-auto mt-16 max-w-md text-center">
+          <h1 className="text-xl font-semibold text-[#0b0b0b]">We couldn't build that dashboard</h1>
+          <p className="mt-2 text-sm text-[#52514e]">{dashboardError}</p>
+          <button type="button" onClick={retry} className="mt-4 rounded-xl bg-[#2a78d6] px-5 py-2.5 text-sm font-medium text-white hover:bg-[#1c5cab]">
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // phase is 'rendering' or 'done'
+  return (
+    <div className="mx-auto max-w-6xl px-4 py-6" aria-busy={phase === 'rendering'}>
+      <div className="mb-6"><PromptBar onSubmit={submit} /></div>
+      <DashboardView spec={spec!} question={question} panels={panels} debug={debug} onAskSomethingElse={reset} />
+    </div>
+  );
+}
