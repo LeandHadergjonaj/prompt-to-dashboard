@@ -101,7 +101,7 @@ export async function repairSql(params: RepairSqlParams): Promise<string> {
 // Prompt-cache note: schema context + current date live in the SYSTEM message;
 // per-call content (question / failing SQL) in the USER message.
 
-function buildDashboardSystemPrompt(params: {
+export function buildDashboardSystemPrompt(params: {
   currentDate: string;
   schemaContext: string;
 }): string {
@@ -136,6 +136,7 @@ ${schemaContext}
 7. Match string comparisons to the actual case of the sampled values shown in the schema context; when unsure, compare with ILIKE.
 8. Prefer explicit JOIN ... ON syntax over comma joins, and only join tables on keys the schema context supports (foreign keys, or columns the sampled values show are compatible). Always qualify ambiguous column names with a table alias.
 9. Never use SELECT *; always select explicit columns.
+10. PostgreSQL identifiers are case-sensitive. Always wrap every table and column name in double quotes, matching the EXACT capitalization shown in the schema context (e.g. FROM "Invoice" AS i ... SUM(i."Total")). Unquoted identifiers are silently folded to lower-case, so a table named "Invoice" or a column named "InvoiceDate" will not be found without quotes. This applies to every schema, including all-lowercase ones (quoting a lowercase name is always safe). Snake_case aliases you introduce for computed columns (e.g. AS total_revenue) are new lowercase names and do not need quotes.
 
 ## Choosing chart types
 - "stat": a single headline number (a total, an average, a count) with no breakdown — the SQL must return exactly one row. Use valueField for the number, and comparison for a one-clause plain-English comparison (e.g. "vs. 12,400 the prior month") only if the SQL actually computes that comparison value; otherwise null.
