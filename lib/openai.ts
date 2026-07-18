@@ -5,6 +5,7 @@ import {
   DashboardSpecSchema,
   RepairSqlSchema,
   type DashboardSpec,
+  type HistoryTurn,
   type PanelSpec,
 } from "./types";
 
@@ -51,6 +52,22 @@ export interface GenerateDashboardParams {
   question: string;
   currentDate: string;   // 'YYYY-MM-DD'
   schemaContext: string; // contents of db/schema-context.md
+  history: HistoryTurn[]; // prior turns, oldest first; [] for a first request
+}
+
+// Each prior turn becomes a real user/assistant message pair, so the model
+// sees the conversation the same way a chat model expects it. The assistant
+// side is a compact JSON record of the dashboard that turn produced — enough
+// to resolve references ("this", "that chart") and to copy unchanged SQL
+// verbatim, without replaying full result sets.
+function historyToInput(history: HistoryTurn[]) {
+  return history.flatMap((turn) => [
+    { role: "user" as const, content: turn.question },
+    {
+      role: "assistant" as const,
+      content: JSON.stringify({ title: turn.dashboardTitle, panels: turn.panels }),
+    },
+  ]);
 }
 
 export async function generateDashboardSpec(params: GenerateDashboardParams): Promise<DashboardSpec> {
@@ -60,6 +77,7 @@ export async function generateDashboardSpec(params: GenerateDashboardParams): Pr
       model,
       input: [
         { role: "system", content: systemPrompt },
+        ...historyToInput(params.history),
         { role: "user", content: params.question },
       ],
       reasoning: { effort: "medium" },
@@ -154,11 +172,25 @@ ${schemaContext}
 - Every panel needs a short human title (60 characters or fewer) and a one-sentence plain-English description of what it shows (e.g. "Total revenue for each region over the trailing 12 months.").
 - Give the whole dashboard a short title (80 characters or fewer) that reflects the user's question, and a one-sentence plain-English summary (the summary field) describing what the dashboard shows.
 
+## Conversation continuity
+The conversation may contain earlier turns. Each prior user message is a previous request; each prior assistant message is a compact JSON record of the dashboard that request produced ({ title, panels: [{ title, chartType, sql }] }). The MOST RECENT assistant message is the dashboard currently on the user's screen. Every response must set the "mode" field:
+- "update" — the new message refines, extends, or transforms the dashboard on screen: e.g. "make this a pie chart", "add revenue by country", "remove the second chart", "only show 2024", "break that down by genre", "sort it the other way". Words like "this", "that", "it" refer to the current dashboard's panels — pick the panel(s) the request most plausibly targets (for a single-panel dashboard, that panel).
+- "new" — the message asks about a different subject than what's on screen, or explicitly starts over ("new dashboard", "forget that, show me…"). When in doubt between update and new, prefer "update" if the message would be ambiguous on its own (pronouns, missing subject) and "new" if it is a complete, self-contained request about something else.
+- When there are no prior turns, mode is always "new".
+
+Rules for mode "update":
+1. Return the FULL updated dashboard, never a diff: every panel that should remain on screen must be included again in the panels array.
+2. Copy the sql of every panel you are NOT changing EXACTLY character-for-character from the previous assistant message. The app reuses cached query results only when the SQL matches exactly — any gratuitous reformatting forces a needless re-query.
+3. For panels the user is changing, update sql and field mappings as needed. When converting to a chart type with different needs, reshape the query so the target chart reads well — e.g. a 50-row ranked table becoming a pie should aggregate to the top handful of categories, not keep 50 rows.
+4. For "add …" requests, keep the existing panels and append the new one(s). Respect the 6-panel cap by dropping the least relevant older panels only if you must.
+5. Keep the dashboard title and summary unless the dashboard's overall content changed enough that they would be wrong.
+For mode "new", design the dashboard from scratch and ignore the prior panels.
+
 ## Output format
 Return only the JSON object described by the response schema. Do not wrap it in markdown code fences. Do not add commentary before or after it.`;
 }
 
-function buildRepairSystemPrompt(schemaContext: string): string {
+export function buildRepairSystemPrompt(schemaContext: string): string {
   return `You are a PostgreSQL expert fixing a single broken query inside a generated dashboard panel. You will be given the original user question, the panel's title and chart type, the SQL that failed, and the exact database error message. Return a corrected single SELECT/WITH statement that fixes the error while still answering the original intent of the panel as closely as possible.
 
 ## Database schema
