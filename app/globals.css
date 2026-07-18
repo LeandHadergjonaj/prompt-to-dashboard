@@ -1,1 +1,180 @@
 @import "tailwindcss";
+
+/* ==========================================================================
+   Design system — ported from the imported "prompt→dashboard" marketing
+   design (Home.dc.html). These tokens are the single source of truth shared
+   by the marketing site and the working app so the two read as one product.
+   ========================================================================== */
+@theme {
+  /* Fonts */
+  --font-sans: "Hanken Grotesk", system-ui, -apple-system, sans-serif;
+  --font-serif: "Newsreader", ui-serif, Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* Surfaces */
+  --color-cream: #f4f1ea; /* page background */
+  --color-panel: #efe9dd; /* warm section / footer */
+  --color-panel-2: #faf8f3; /* subtle inset */
+  --color-field: #fdfcf9; /* input background */
+  --color-surface: #ffffff; /* cards */
+  --color-skeleton: #ece7dd; /* loading placeholders */
+
+  /* Ink + text */
+  --color-ink: #16130e; /* headings / primary text */
+  --color-muted: #5c554a; /* body copy */
+  --color-muted-2: #6b6459; /* secondary copy */
+  --color-faint: #8a8275; /* mono labels / captions */
+  --color-placeholder: #b0a998;
+
+  /* Brand green */
+  --color-brand: #1d5c4a;
+  --color-brand-strong: #164a3b; /* button hover */
+  --color-brand-deep: #123f33; /* link hover */
+  --color-brand-soft: #7fbfa9; /* on-dark accent */
+  --color-brand-tint: #bfe3d6;
+  --color-brand-pos: #1f7a52; /* positive numbers */
+
+  /* Warm accent (errors / "the old way" / secondary series) */
+  --color-warm: #c9622f;
+  --color-warm-tint: #f3e4d6;
+
+  /* Hairlines */
+  --color-line-soft: rgba(22, 19, 14, 0.06);
+  --color-line: rgba(22, 19, 14, 0.09);
+  --color-line-strong: rgba(22, 19, 14, 0.16);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(29, 92, 74, 0.16);
+}
+
+/* ---- Motion (ported verbatim from the design) ------------------------- */
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+@keyframes grow {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes pulse-soft {
+  50% {
+    opacity: 0.4;
+  }
+}
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(26px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes floaty {
+  50% {
+    transform: translateY(-8px);
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+  60% {
+    transform: scale(1.06);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Scroll-driven reveals — progressive enhancement, no-ops where unsupported */
+@supports (animation-timeline: view()) {
+  [data-reveal] {
+    animation: reveal 0.9s linear both;
+    animation-timeline: view();
+    animation-range: entry 0% entry 52%;
+  }
+  [data-grow] {
+    animation: grow 0.9s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+    transform-origin: bottom;
+    animation-timeline: view();
+    animation-range: entry 8% cover 26%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-reveal],
+  [data-grow],
+  [data-rise] {
+    animation: none !important;
+  }
+}
+
+/* ---- Marketing responsive reflow ------------------------------------- */
+/* The imported design is desktop-only; these collapse its fixed grids so the
+   page stays usable on tablet/mobile without altering the desktop look. */
+@media (max-width: 900px) {
+  .hero-grid,
+  .how-grid,
+  .compare-grid,
+  .pain-grid {
+    grid-template-columns: 1fr !important;
+    gap: 20px !important;
+  }
+  .hero-h1 {
+    font-size: 44px !important;
+  }
+  .compare-vs {
+    display: none !important;
+  }
+  .compare-old,
+  .compare-new {
+    border-radius: 16px !important;
+  }
+  .footer-grid {
+    grid-template-columns: 1fr 1fr !important;
+  }
+  header nav a[href="#how"],
+  header nav a[href="#compare"] {
+    display: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .footer-grid {
+    grid-template-columns: 1fr !important;
+  }
+}
