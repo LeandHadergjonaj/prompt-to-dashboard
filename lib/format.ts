@@ -212,24 +212,43 @@ export function formatUnitValue(raw: unknown, unit: Unit | null | undefined, mod
 
 // ---------- palette ----------
 
-// Validated against a white surface with the dataviz palette validator: all
-// hard gates pass. Three hues (magenta/amber/aqua) fall below 3:1 text
-// contrast on white, so palette colors are used ONLY as fills/strokes — all
-// text renders in ink colors (#0b0b0b / #52514e).
+// Brand-derived categorical palette for the "prompt→dashboard" design system.
+// Led by the two brand hues (deep green + terracotta) that the marketing
+// design itself uses for chart bars, then an earthy, muted spread chosen for
+// hue separation on white/cream surfaces. Used ONLY as fills/strokes — all
+// chart text renders in ink/muted tones for contrast.
 export const PALETTE = [
-  '#2a78d6', // blue
-  '#008300', // green
-  '#e87ba4', // magenta/rose
-  '#eda100', // amber
-  '#1baf7a', // aqua/teal
-  '#eb6834', // orange
-  '#4a3aa7', // violet
-  '#e34948', // red
+  '#1d5c4a', // deep green (brand primary)
+  '#c9622f', // terracotta (brand warm)
+  '#3d6e8e', // dusty blue
+  '#c99a3f', // gold
+  '#7a4e8e', // plum
+  '#a8324a', // raspberry
+  '#4f7d6d', // sage
+  '#8a6d3b', // bronze
 ] as const;
 
 export function colorForSeriesIndex(i: number): string {
   return PALETTE[i % PALETTE.length];
 }
+
+// Shared chart chrome so every recharts panel reads as one system.
+export const CHART_GRID = '#e7e2d6'; // warm gridlines
+export const CHART_AXIS_TEXT = '#8a8275'; // faint mono-ish ticks
+export const CHART_AXIS_LINE = '#d8d0c2';
+export const CHART_SURFACE = '#ffffff'; // stroke gap behind marks/slices
+export const PIE_OTHER = '#c9c1b2'; // neutral "Other" slice
+
+export const CHART_TOOLTIP_STYLE = {
+  borderRadius: 10,
+  border: '1px solid rgba(22,19,14,0.12)',
+  boxShadow: '0 12px 28px -14px rgba(22,19,14,0.35)',
+  fontSize: 12,
+  fontFamily: "'Hanken Grotesk', system-ui, sans-serif",
+  color: '#16130e',
+} as const;
+
+export const CHART_TOOLTIP_LABEL_STYLE = { color: '#8a8275', fontWeight: 600 } as const;
 
 export function dashArrayForSeriesIndex(i: number): string | undefined {
   return i < PALETTE.length ? undefined : '6 3';
