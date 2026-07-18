@@ -4,20 +4,23 @@ import type { ColumnMeta } from '@/lib/types';
 
 export function TablePanel({ columns, rows, truncated }: { columns: ColumnMeta[]; rows: unknown[][]; truncated: boolean }) {
   return (
-    <div className="overflow-x-auto rounded-xl border border-gray-200">
+    <div className="overflow-x-auto rounded-xl border border-line">
       <table className="w-full text-sm">
-        <thead className="bg-gray-50 text-left text-xs font-medium uppercase tracking-wide text-gray-500">
+        <thead className="bg-panel-2 text-left font-mono text-[11px] font-medium uppercase tracking-[.06em] text-faint">
           <tr>
             {columns.map((c) => (
-              <th key={c.name} className="px-4 py-2 whitespace-nowrap">{c.name}</th>
+              <th key={c.name} className="whitespace-nowrap px-4 py-2.5">{c.name}</th>
             ))}
           </tr>
         </thead>
-        <tbody className="divide-y divide-gray-100">
+        <tbody className="divide-y divide-line-soft">
           {rows.map((row, i) => (
-            <tr key={i} className="hover:bg-gray-50">
+            <tr key={i} className="transition-colors hover:bg-panel-2/60">
               {row.map((cell, j) => (
-                <td key={j} className={`px-4 py-2 whitespace-nowrap ${typeof cell === 'number' ? 'tabular-nums text-right' : 'text-left'}`}>
+                <td
+                  key={j}
+                  className={`whitespace-nowrap px-4 py-2.5 text-ink ${typeof cell === 'number' ? 'text-right tabular-nums' : 'text-left'}`}
+                >
                   {cell === null || cell === undefined ? '—' : typeof cell === 'number' ? formatCountFull(cell) : String(cell)}
                 </td>
               ))}
@@ -26,8 +29,8 @@ export function TablePanel({ columns, rows, truncated }: { columns: ColumnMeta[]
         </tbody>
       </table>
       {truncated && (
-        <div className="border-t border-gray-200 bg-amber-50 px-4 py-2 text-xs text-amber-800">
-          Showing a partial result — there's more data than fits here.
+        <div className="border-t border-line px-4 py-2 font-mono text-[11px]" style={{ background: '#F3E4D6', color: '#a23e17' }}>
+          Showing a partial result — there’s more data than fits here.
         </div>
       )}
     </div>
