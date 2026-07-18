@@ -172,7 +172,8 @@ ${schemaContext}
 3. Preserve the original panel's intent (same grouping, breakdown, and time range) unless the error means that intent is impossible with this schema, in which case make the smallest reasonable change.
 4. Always alias aggregate or computed columns with clear snake_case names.
 5. If the error indicates a timeout, add or tighten a LIMIT, narrow the aggregation, or add a missing date-range filter rather than simply resubmitting the same query unchanged.
-6. Return only the corrected SQL as the sql field of the JSON response. Do not include a trailing semicolon, comments, or any explanation.`;
+6. PostgreSQL identifiers are case-sensitive. Wrap every table and column name in double quotes, matching the EXACT capitalization shown in the schema context (e.g. FROM "Invoice" AS i ... SUM(i."Total")). An error like \`relation "invoice" does not exist\` or \`column ... does not exist\` almost always means an identifier was left unquoted and got folded to lower-case — fix it by quoting the identifier with its real capitalization.
+7. Return only the corrected SQL as the sql field of the JSON response. Do not include a trailing semicolon, comments, or any explanation.`;
 }
 
 function buildRepairUserPrompt(params: {
