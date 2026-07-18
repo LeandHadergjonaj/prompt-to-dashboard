@@ -56,6 +56,7 @@ export async function POST(req: NextRequest) {
       question: parsed.data.question,
       currentDate,
       schemaContext,
+      history: parsed.data.history,
     });
   } catch (err) {
     const debug = err instanceof Error ? err.message : String(err);
@@ -95,8 +96,10 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // A first-turn request can only ever be a fresh dashboard, whatever the model says.
+  const mode = parsed.data.history.length === 0 ? "new" : spec.mode;
   const responseBody: DashboardResponse = {
-    spec: { title: spec.title, summary: spec.summary, panels: panelsWithIds },
+    spec: { mode, title: spec.title, summary: spec.summary, panels: panelsWithIds },
   };
   return NextResponse.json(responseBody, { status: 200 });
 }
