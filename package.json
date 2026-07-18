@@ -39,6 +39,7 @@
     "test": "tsx scripts/test-sqlguard.ts && tsx scripts/test-prompt.ts"
   },
   "dependencies": {
+    "html-to-image": "^1.11.13",
     "next": "15.5.20",
     "openai": "^5.23.2",
     "pg": "^8.22.0",
