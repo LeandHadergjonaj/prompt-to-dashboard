@@ -1,12 +1,38 @@
 {
   "name": "text-to-sql",
   "version": "0.1.0",
+  "description": "Text-to-dashboard agent: ask a plain-English question, get a live dashboard backed by a safety-guarded, LLM-generated SQL pipeline.",
+  "keywords": [
+    "text-to-sql",
+    "llm",
+    "dashboard",
+    "openai",
+    "nextjs",
+    "postgres",
+    "supabase",
+    "recharts",
+    "data-visualization"
+  ],
+  "homepage": "https://github.com/LeandHadergjonaj/text-to-sql#readme",
+  "bugs": {
+    "url": "https://github.com/LeandHadergjonaj/text-to-sql/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LeandHadergjonaj/text-to-sql.git"
+  },
+  "license": "MIT",
+  "author": "Leand Hadergjonaj",
+  "engines": {
+    "node": ">=20"
+  },
   "private": true,
   "scripts": {
     "dev": "next dev --turbopack",
     "build": "next build --turbopack",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:sqlguard": "tsx scripts/test-sqlguard.ts"
   },
   "dependencies": {
     "next": "15.5.20",
@@ -27,6 +53,7 @@
     "eslint": "^9",
     "eslint-config-next": "15.5.20",
     "tailwindcss": "^4",
+    "tsx": "^4.23.1",
     "typescript": "^5"
   }
 }
