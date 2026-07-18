@@ -47,6 +47,25 @@ const cases: { name: string; input: string; expectOk: boolean; expectReason?: st
     expectOk: false,
     expectReason: "forbidden keyword: DROP",
   },
+  {
+    // CamelCase schema (e.g. Chinook): identifiers MUST be double-quoted to
+    // survive PostgreSQL's lower-case folding. The guard must accept such SQL
+    // — quoting is the fix for the CamelCase-identifier bug, not a threat.
+    name: "9 quoted CamelCase identifiers pass",
+    input:
+      'SELECT c."FirstName" || \' \' || c."LastName" AS customer_name, SUM(i."Total") AS total_spent FROM "Invoice" AS i JOIN "Customer" AS c ON c."CustomerId" = i."CustomerId" GROUP BY c."CustomerId", c."FirstName", c."LastName" ORDER BY total_spent DESC LIMIT 5',
+    expectOk: true,
+  },
+  {
+    // A double-quoted identifier that happens to look like a forbidden keyword
+    // is still an identifier, not a statement — but the guard is a coarse
+    // whole-word scan, so this is a DOCUMENTED accepted over-rejection. Pinning
+    // it here means any future change to that behavior is a conscious decision.
+    name: "10 quoted identifier colliding with keyword over-rejects (documented)",
+    input: 'SELECT "Update" FROM "AuditLog"',
+    expectOk: false,
+    expectReason: "forbidden keyword: UPDATE",
+  },
 ];
 
 let failures = 0;
