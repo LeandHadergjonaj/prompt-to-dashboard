@@ -113,18 +113,6 @@ cd text-to-sql
 npm install
 ```
 
-### Create the read-only role
-
-The app should only ever connect as a dedicated, `SELECT`-only role (see
-[Safety model](#safety-model)):
-
-```bash
-psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -v reader_password="<choose-a-password>" -f db/readonly_role.sql
-```
-
-The script is idempotent; optional commented blocks cover row-level-security policies and
-schema-wide hardening.
-
 ### Configuration
 
 ```bash
@@ -133,25 +121,47 @@ cp .env.example .env.local
 
 | Variable | Required | Description |
 |---|---|---|
-| `DATABASE_URL_READONLY` | yes | Connection string for the **read-only** role created above (never point this at an admin role). TLS is controlled by the URL's `sslmode` parameter — use `sslmode=no-verify` for providers whose certificate chain can't be fully verified. |
 | `OPENAI_API_KEY` | yes | Your OpenAI API key. |
+| `DATABASE_URL_READONLY` | no | Optional **built-in connection**: a read-only connection string exposed to every user of the deployment (see below). With in-app onboarding this is no longer required. |
+| `APP_SECRET` | no | Key material for connection-credential encryption and identity-cookie signing. When unset, a random key is generated once and persisted at `.data/secret.key`. Set it explicitly in production so the data in `.data/` survives moves between hosts. |
 | `OPENAI_MODEL` | no | Overrides the default model (`gpt-5.6-terra`). |
 | `NEXT_PUBLIC_CURRENCY` | no | ISO 4217 code used to format `currency` values (default `USD`). |
 | `NEXT_PUBLIC_LOCALE` | no | BCP 47 locale used for number/date formatting (default `en-US`). |
 
-### Generate the schema context
+### Connect a database (in-app, recommended)
 
-The LLM's understanding of your database comes from a generated markdown file, not a live schema
-call on every request:
+Open **`/app/connect`** and paste an admin connection string once. The app then:
+
+1. creates (or rotates) a dedicated `SELECT`-only `dashboard_reader` role with a generated password,
+2. introspects the schema (tables, columns, foreign keys, row counts, sampled values, date coverage),
+3. verifies the new role can read but **cannot** write (a write probe must fail),
+4. shows a plain-English summary of what it found,
+5. stores only the **read-only** connection string, AES-256-GCM-encrypted, in the app's local
+   metadata store (`.data/app.db`). The admin credentials are used for that one request and never persisted.
+
+Connections, saved dashboards, and learned examples are all scoped to the browser identity
+(a signed cookie), so multiple users of one deployment don't see each other's data.
+
+### Or: env-configured built-in connection
+
+The pre-onboarding setup still works and is useful for a single-database deployment where
+everyone should share one connection. Create the role manually:
+
+```bash
+psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -v reader_password="<choose-a-password>" -f db/readonly_role.sql
+```
+
+set `DATABASE_URL_READONLY` to the resulting role's connection string, then generate the LLM's
+schema context file:
 
 ```bash
 DATABASE_URL="<admin or read-only connection string>" npm run introspect
 ```
 
-This writes `db/schema-context.md` — tables, columns, foreign keys, row counts, and
-sampled/distinct values for low-cardinality columns. It is **local to your deployment and
-gitignored** (it contains your schema and sampled data values — treat it as sensitive).
-Re-run it whenever your schema changes.
+This writes `db/schema-context.md` — **local to your deployment and gitignored** (it contains
+your schema and sampled data values — treat it as sensitive). Re-run it whenever your schema
+changes. In-app-onboarded connections refresh their context by re-running `/app/connect`
+against the same database.
 
 ### Run
 
@@ -167,28 +177,38 @@ npm run build && npm run start   # production build
 
 ```
 .
-├── app/                         # thin demo/dev harness around the engine
+├── app/
 │   ├── api/
-│   │   ├── dashboard/route.ts   # question -> dashboard spec (1 LLM call)
+│   │   ├── dashboard/route.ts   # question -> dashboard spec (1 LLM call, few-shot retrieval)
 │   │   ├── panel/route.ts       # sql -> validated, executed query result
-│   │   └── repair/route.ts      # failing sql -> corrected sql (1 LLM call)
+│   │   ├── repair/route.ts      # failing sql -> corrected sql (1 LLM call)
+│   │   ├── connections/         # onboarding: create/list/delete database connections
+│   │   └── dashboards/          # saved dashboards: save/list/open/rename/delete
+│   ├── app/                     # the product: dashboard UI, /connect wizard, /dashboards list
 │   ├── layout.tsx
-│   └── page.tsx                 # dashboard UI shell / view state machine
+│   └── page.tsx                 # marketing homepage
 ├── components/
 │   ├── charts/                  # one component per chart type + dispatcher
 │   └── *.tsx                    # prompt bar, dashboard grid, panel card, download menu, error/empty states
 ├── hooks/
-│   └── useDashboard.ts          # fetch orchestration, conversation history, per-panel state, repair retries
+│   └── useDashboard.ts          # fetch orchestration, conversation history, per-panel state, save/load
 ├── lib/                         # the engine
 │   ├── env.ts                   # fail-fast environment validation
 │   ├── types.ts                 # Zod schemas: single source of truth for types + LLM JSON schema
-│   ├── schemaContext.ts         # lazy loader for the generated schema context
-│   ├── sqlGuard.ts              # SQL safety guard (see Safety model)
-│   ├── db.ts                    # read-only pool + panel query execution
+│   ├── appStore.ts              # SQLite metadata store (.data/app.db): users, connections, dashboards, examples
+│   ├── identity.ts              # anonymous signed-cookie per-browser identity
+│   ├── secrets.ts               # AES-256-GCM credential encryption + cookie signing
+│   ├── connections.ts           # onboarding, encrypted DSNs, per-connection pools + execution contexts
+│   ├── introspect.ts            # schema introspection -> markdown context + binding catalog + stats
+│   ├── dashboards.ts            # saved-dashboard store access
+│   ├── examples.ts              # accepted (question -> SQL) store + embedding retrieval
+│   ├── schemaContext.ts         # lazy loader for the env connection's generated schema context
+│   ├── sqlGuard.ts              # AST-based SQL guard + legacy fallback (see Safety model)
+│   ├── db.ts                    # read-only pool factory + panel query execution
 │   ├── download.ts              # client-side CSV/JSON/PNG export helpers
-│   └── openai.ts                # OpenAI client, prompts, dashboard/repair generation
+│   └── openai.ts                # OpenAI client, prompts, dashboard/repair/summary generation, embeddings
 ├── db/
-│   ├── readonly_role.sql        # generic read-only role setup
+│   ├── readonly_role.sql        # generic read-only role setup (manual/env path)
 │   └── schema-context.md        # generated locally per deployment (gitignored)
 ├── skills/                      # gathered, sourced knowledge on doing this work well
 │   ├── dashboard-design/        # chart choice, composition, design rules
@@ -196,7 +216,7 @@ npm run build && npm run start   # production build
 │   ├── text-to-sql/             # LLM SQL generation techniques and guardrails
 │   └── conversational-analytics/# multi-turn follow-up design
 └── scripts/
-    ├── introspect-schema.mjs    # generates db/schema-context.md from any Postgres DB
+    ├── introspect-schema.ts     # generates db/schema-context.md (env connection path)
     └── test-sqlguard.ts         # sqlGuard unit test cases
 ```
 
@@ -272,12 +292,16 @@ of which would stop a write on its own:
 
 1. **Dedicated Postgres role** (`dashboard_reader`, created by `db/readonly_role.sql`) — `SELECT`-only grants, `default_transaction_read_only = on`, a 20s `statement_timeout`, and no `CREATE` privilege on the schema.
 2. **Read-only transactions** — every panel query runs inside `BEGIN TRANSACTION READ ONLY`.
-3. **Application-level guard** (`lib/sqlGuard.ts`) — strips comments, rejects multi-statement input, requires the query to start with `SELECT`/`WITH`, and rejects a 34-keyword denylist (`INSERT`, `DROP`, `GRANT`, `COPY`, …) via word-boundary matching. Covered by unit tests: `npm run test:sqlguard`.
+3. **Application-level AST guard** (`lib/sqlGuard.ts`) — parses every candidate query with the real PostgreSQL parser ([libpg-query](https://github.com/launchql/libpg-query-node), WASM) and validates it structurally: exactly one statement, and it must be a `SelectStmt` (every write/DDL/utility statement is a different node type, which covers the whole old keyword denylist with zero false positives on literals); no `SELECT … INTO`, no `FOR UPDATE/SHARE`, no data-modifying CTEs; a denylist of dangerous *functions* (`pg_sleep`, `pg_read_file`, `dblink*`, `pg_advisory_*`, `set_config`, the `query_to_xml` family, …); and **table-level identifier binding** — every referenced table must exist in the connection's introspected catalog (or be a CTE), which blocks `pg_catalog`/`information_schema` reads and catches hallucinated tables before execution. If the parser module ever fails to load, the previous keyword-denylist guard (kept in the same file) takes over automatically, so coverage never drops below the old level. Covered by unit tests: `npm run test:sqlguard`.
 4. **Hard result cap** — every query is wrapped as `SELECT * FROM (...) AS _panel LIMIT 5001`, so even a legitimate but unbounded `SELECT` can't return unlimited rows.
 
 ## Roadmap
 
-- [ ] Saved / shareable dashboards
+- [x] Saved dashboards (per-user; shareable links still to come)
+- [x] In-app database onboarding (read-only role + introspection + verification)
+- [x] Few-shot learning from accepted queries (per-connection example store + embedding retrieval)
+- [x] AST-based SQL validation with identifier binding
+- [ ] Real authentication (the current per-browser cookie identity is the seam to swap it into)
 - [ ] Streaming panel generation (render as the spec streams, not after)
 - [ ] Query-result caching
 - [ ] Drill-down interactions on charts
