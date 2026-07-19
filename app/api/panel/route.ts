@@ -1,18 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
-import { PanelRequestSchema, type ApiErrorBody, type PanelResponse } from "@/lib/types";
+import { PanelRequestSchema, type PanelResponse } from "@/lib/types";
 import { checkSql } from "@/lib/sqlGuard";
 import { executePanelQuery } from "@/lib/db";
-
-function errorResponse(
-  status: number,
-  code: ApiErrorBody["error"]["code"],
-  friendlyMessage: string,
-  debug: string | null
-): NextResponse<ApiErrorBody> {
-  return NextResponse.json({ error: { code, friendlyMessage, debug } }, { status });
-}
+import { getCurrentUserId } from "@/lib/identity";
+import { getExecutionContext, ConnectionError } from "@/lib/connections";
+import { errorResponse, connectionErrorResponse } from "@/lib/apiErrors";
+import { SchemaContextMissingError } from "@/lib/schemaContext";
 
 export async function POST(req: NextRequest) {
+  const userId = await getCurrentUserId();
+
   let body: unknown;
   try {
     body = await req.json();
@@ -25,7 +22,17 @@ export async function POST(req: NextRequest) {
     return errorResponse(400, "invalid_request", "That chart request wasn't valid.", parsed.error.message);
   }
 
-  const guard = checkSql(parsed.data.sql);
+  let context;
+  try {
+    context = await getExecutionContext(userId, parsed.data.connectionId);
+  } catch (err) {
+    if (err instanceof ConnectionError || err instanceof SchemaContextMissingError) {
+      return connectionErrorResponse(err);
+    }
+    throw err;
+  }
+
+  const guard = await checkSql(parsed.data.sql, context.catalog);
   if (!guard.ok) {
     return errorResponse(
       400,
@@ -36,7 +43,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const result = await executePanelQuery(guard.sanitizedSql!);
+    const result = await executePanelQuery(context.pool, guard.sanitizedSql!);
     const responseBody: PanelResponse = result;
     return NextResponse.json(responseBody, { status: 200 });
   } catch (err) {

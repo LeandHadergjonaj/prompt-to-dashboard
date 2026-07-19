@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { z } from "zod";
 import { zodTextFormat } from "openai/helpers/zod";
 import { env } from "./env";
 import {
@@ -48,11 +49,17 @@ async function callWithFallback<T>(fn: (model: string) => Promise<T>): Promise<T
   }
 }
 
+export interface FewShotExample {
+  question: string;
+  sql: string;
+}
+
 export interface GenerateDashboardParams {
   question: string;
   currentDate: string;   // 'YYYY-MM-DD'
-  schemaContext: string; // contents of db/schema-context.md
+  schemaContext: string; // the connection's introspected schema context
   history: HistoryTurn[]; // prior turns, oldest first; [] for a first request
+  examples?: FewShotExample[]; // retrieved accepted pairs for this database
 }
 
 // Each prior turn becomes a real user/assistant message pair, so the model
@@ -70,6 +77,26 @@ function historyToInput(history: HistoryTurn[]) {
   ]);
 }
 
+// Retrieved few-shot examples ride in a SECOND system message, after the
+// static prompt, so the prompt-cache prefix (static system prompt + schema)
+// stays byte-stable across questions.
+function examplesToInput(examples: FewShotExample[] | undefined) {
+  if (!examples || examples.length === 0) return [];
+  const rendered = examples
+    .map((e) => `Q: ${e.question}\nSQL:\n${e.sql}`)
+    .join("\n\n");
+  return [
+    {
+      role: "system" as const,
+      content:
+        `## Proven examples from this database\n` +
+        `The following question -> SQL pairs were previously generated for THIS same database and accepted by the user. ` +
+        `They are known to run correctly. When the new question resembles one of them, imitate its table/column identifiers, join paths, filters, and conventions rather than inventing new ones. ` +
+        `Ignore them when they are not relevant.\n\n${rendered}`,
+    },
+  ];
+}
+
 export async function generateDashboardSpec(params: GenerateDashboardParams): Promise<DashboardSpec> {
   const systemPrompt = buildDashboardSystemPrompt(params);
   return callWithFallback(async (model) => {
@@ -77,6 +104,7 @@ export async function generateDashboardSpec(params: GenerateDashboardParams): Pr
       model,
       input: [
         { role: "system", content: systemPrompt },
+        ...examplesToInput(params.examples),
         ...historyToInput(params.history),
         { role: "user", content: params.question },
       ],
@@ -113,6 +141,54 @@ export async function repairSql(params: RepairSqlParams): Promise<string> {
     });
     if (!response.output_parsed) throw new LlmError("model returned no parseable repair", response);
     return response.output_parsed.sql;
+  });
+}
+
+// Embeddings for few-shot example retrieval. No model fallback — callers
+// treat embedding failure as "no examples", never as a request failure.
+const EMBEDDING_MODEL = "text-embedding-3-small";
+
+export async function embedTexts(texts: string[]): Promise<number[][]> {
+  const response = await client.embeddings.create({ model: EMBEDDING_MODEL, input: texts });
+  return response.data
+    .slice()
+    .sort((a, b) => a.index - b.index)
+    .map((d) => d.embedding);
+}
+
+export interface ConnectionSummaryStats {
+  databaseName: string;
+  tableCount: number;
+  totalApproxRows: number;
+  tables: { name: string; approxRows: number; columnCount: number }[];
+  dateRanges: { column: string; from: string; to: string }[];
+}
+
+// Plain-English onboarding reassurance ("what we found in your database").
+// Callers must catch failures and fall back to a deterministic summary —
+// onboarding never fails because of this call.
+export async function generateConnectionSummary(stats: ConnectionSummaryStats): Promise<string> {
+  const SummarySchema = z.object({ summary: z.string() });
+  return callWithFallback(async (model) => {
+    const response = await client.responses.parse({
+      model,
+      input: [
+        {
+          role: "system",
+          content:
+            "You write the confirmation message a non-technical user sees right after connecting their database to a dashboard tool. " +
+            "Given machine-generated statistics about the database, write 2-3 warm, plain-English sentences describing what was found: " +
+            "what the data seems to be about (inferred from table names), how much of it there is (round numbers), and what time period it covers if dates are present. " +
+            "No jargon (no 'schema', 'rows' is fine), no column names, no advice, no exclamation marks, no markdown. Do not mention SQL or roles.",
+        },
+        { role: "user", content: JSON.stringify(stats) },
+      ],
+      reasoning: { effort: "low" },
+      text: { verbosity: "low", format: zodTextFormat(SummarySchema, "connection_summary") },
+      max_output_tokens: 400,
+    });
+    if (!response.output_parsed) throw new LlmError("no parseable summary", response);
+    return response.output_parsed.summary;
   });
 }
 

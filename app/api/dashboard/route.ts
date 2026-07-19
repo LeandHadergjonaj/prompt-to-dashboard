@@ -1,24 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   DashboardRequestSchema,
-  type ApiErrorBody,
   type DashboardResponse,
   type PanelWithId,
 } from "@/lib/types";
-import { generateDashboardSpec } from "@/lib/openai";
+import { generateDashboardSpec, type FewShotExample } from "@/lib/openai";
 import { checkSql } from "@/lib/sqlGuard";
-import { getSchemaContext } from "@/lib/schemaContext";
-
-function errorResponse(
-  status: number,
-  code: ApiErrorBody["error"]["code"],
-  friendlyMessage: string,
-  debug: string | null
-): NextResponse<ApiErrorBody> {
-  return NextResponse.json({ error: { code, friendlyMessage, debug } }, { status });
-}
+import { getCurrentUserId } from "@/lib/identity";
+import { getExecutionContext, ConnectionError } from "@/lib/connections";
+import { retrieveExamples } from "@/lib/examples";
+import { errorResponse, connectionErrorResponse } from "@/lib/apiErrors";
+import { SchemaContextMissingError } from "@/lib/schemaContext";
 
 export async function POST(req: NextRequest) {
+  const userId = await getCurrentUserId();
+
   let body: unknown;
   try {
     body = await req.json();
@@ -38,16 +34,28 @@ export async function POST(req: NextRequest) {
 
   const currentDate = new Date().toISOString().slice(0, 10);
 
-  let schemaContext: string;
+  let context;
   try {
-    schemaContext = getSchemaContext();
+    context = await getExecutionContext(userId, parsed.data.connectionId);
   } catch (err) {
-    return errorResponse(
-      500,
-      "internal_error",
-      "This app isn't connected to a database schema yet. Ask whoever runs it to generate the schema context.",
-      err instanceof Error ? err.message : String(err)
-    );
+    if (err instanceof SchemaContextMissingError) {
+      return errorResponse(
+        500,
+        "internal_error",
+        "This app isn't connected to a database schema yet. Ask whoever runs it to generate the schema context.",
+        err.message
+      );
+    }
+    if (err instanceof ConnectionError) return connectionErrorResponse(err);
+    throw err;
+  }
+
+  // Few-shot retrieval from previously accepted pairs; never blocks generation.
+  let examples: FewShotExample[] = [];
+  try {
+    examples = await retrieveExamples(userId, context.connectionKey, parsed.data.question);
+  } catch {
+    examples = [];
   }
 
   let spec;
@@ -55,8 +63,9 @@ export async function POST(req: NextRequest) {
     spec = await generateDashboardSpec({
       question: parsed.data.question,
       currentDate,
-      schemaContext,
+      schemaContext: context.schemaContext,
       history: parsed.data.history,
+      examples,
     });
   } catch (err) {
     const debug = err instanceof Error ? err.message : String(err);
@@ -73,8 +82,11 @@ export async function POST(req: NextRequest) {
   const junk = new Set(["/dev/null", "null", "none", ""]);
   const clean = (v: string | null) => (v !== null && junk.has(v.trim().toLowerCase()) ? null : v);
 
+  const guardResults = await Promise.all(
+    spec.panels.map((panel) => checkSql(panel.sql, context.catalog))
+  );
   const panelsWithIds: PanelWithId[] = spec.panels
-    .filter((panel) => checkSql(panel.sql).ok)
+    .filter((_, i) => guardResults[i].ok)
     .slice(0, 6)
     .map((panel, i) => ({
       ...panel,
@@ -92,7 +104,9 @@ export async function POST(req: NextRequest) {
       502,
       "llm_error",
       "The assistant couldn't design a dashboard for that question. Try rephrasing it or being more specific.",
-      "model returned zero panels with guard-passing SQL"
+      `model returned zero panels with guard-passing SQL (first rejection: ${
+        guardResults.find((r) => !r.ok)?.reason ?? "none"
+      })`
     );
   }
 

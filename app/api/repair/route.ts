@@ -1,23 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  RepairRequestSchema,
-  type ApiErrorBody,
-  type RepairResponse,
-} from "@/lib/types";
+import { RepairRequestSchema, type RepairResponse } from "@/lib/types";
 import { repairSql } from "@/lib/openai";
 import { checkSql } from "@/lib/sqlGuard";
-import { getSchemaContext } from "@/lib/schemaContext";
-
-function errorResponse(
-  status: number,
-  code: ApiErrorBody["error"]["code"],
-  friendlyMessage: string,
-  debug: string | null
-): NextResponse<ApiErrorBody> {
-  return NextResponse.json({ error: { code, friendlyMessage, debug } }, { status });
-}
+import { getCurrentUserId } from "@/lib/identity";
+import { getExecutionContext, ConnectionError } from "@/lib/connections";
+import { errorResponse, connectionErrorResponse } from "@/lib/apiErrors";
+import { SchemaContextMissingError } from "@/lib/schemaContext";
 
 export async function POST(req: NextRequest) {
+  const userId = await getCurrentUserId();
+
   let body: unknown;
   try {
     body = await req.json();
@@ -30,16 +22,20 @@ export async function POST(req: NextRequest) {
     return errorResponse(400, "invalid_request", "That repair request wasn't valid.", parsed.error.message);
   }
 
-  let schemaContext: string;
+  let context;
   try {
-    schemaContext = getSchemaContext();
+    context = await getExecutionContext(userId, parsed.data.connectionId);
   } catch (err) {
-    return errorResponse(
-      500,
-      "internal_error",
-      "This app isn't connected to a database schema yet. Ask whoever runs it to generate the schema context.",
-      err instanceof Error ? err.message : String(err)
-    );
+    if (err instanceof SchemaContextMissingError) {
+      return errorResponse(
+        500,
+        "internal_error",
+        "This app isn't connected to a database schema yet. Ask whoever runs it to generate the schema context.",
+        err.message
+      );
+    }
+    if (err instanceof ConnectionError) return connectionErrorResponse(err);
+    throw err;
   }
 
   let repairedSql: string;
@@ -49,7 +45,7 @@ export async function POST(req: NextRequest) {
       panel: parsed.data.panel,
       sql: parsed.data.sql,
       errorMessage: parsed.data.errorMessage,
-      schemaContext,
+      schemaContext: context.schemaContext,
     });
   } catch (err) {
     const debug = err instanceof Error ? err.message : String(err);
@@ -61,7 +57,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const guard = checkSql(repairedSql);
+  const guard = await checkSql(repairedSql, context.catalog);
   if (!guard.ok) {
     return errorResponse(
       502,

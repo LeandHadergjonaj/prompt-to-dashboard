@@ -77,20 +77,54 @@ export type HistoryTurn = z.infer<typeof HistoryTurnSchema>;
 export const MAX_HISTORY_TURNS = 8;
 
 // ---- API request bodies ----
-// `history` defaults to [] so pre-existing single-shot clients keep working.
+// `history` defaults to [] and `connectionId` to null so pre-existing
+// single-shot clients keep working (null = the env-configured connection).
+const ConnectionIdSchema = z.string().max(100).nullable().default(null);
+
 export const DashboardRequestSchema = z.object({
   question: z.string().trim().min(1).max(500),
   history: z.array(HistoryTurnSchema).max(MAX_HISTORY_TURNS).default([]),
+  connectionId: ConnectionIdSchema,
 });
 export const PanelRequestSchema = z.object({
   sql: z.string().trim().min(1).max(10_000),
   chartType: ChartTypeSchema,
+  connectionId: ConnectionIdSchema,
 });
 export const RepairRequestSchema = z.object({
   question: z.string().trim().min(1).max(500),
   panel: PanelSpecSchema,
   sql: z.string().trim().min(1).max(10_000),
   errorMessage: z.string().trim().min(1).max(2_000),
+  connectionId: ConnectionIdSchema,
+});
+
+// ---- Connections (onboarding) ----
+export const CreateConnectionRequestSchema = z.object({
+  name: z.string().trim().min(1).max(60),
+  adminUrl: z.string().trim().min(1).max(1_000),
+});
+
+// ---- Saved dashboards ----
+// The client sends each panel's EFFECTIVE SQL (post-repair) inside spec, plus
+// which panels actually rendered — those become few-shot example material.
+export const PanelWithIdSchema = PanelSpecSchema.extend({ id: z.string().max(40) });
+export const SavedSpecSchema = z.object({
+  mode: DashboardModeSchema,
+  title: z.string().max(200),
+  summary: z.string().max(1_000),
+  panels: z.array(PanelWithIdSchema).min(1).max(6),
+});
+export const SaveDashboardRequestSchema = z.object({
+  connectionId: ConnectionIdSchema,
+  title: z.string().trim().min(1).max(120),
+  question: z.string().trim().max(500).default(""),
+  spec: SavedSpecSchema,
+  history: z.array(HistoryTurnSchema).max(MAX_HISTORY_TURNS).default([]),
+  readyPanelIds: z.array(z.string().max(40)).max(6).default([]),
+});
+export const RenameDashboardRequestSchema = z.object({
+  title: z.string().trim().min(1).max(120),
 });
 
 // ---- API response bodies ----
@@ -110,11 +144,13 @@ export type RepairResponse = { sql: string };
 
 // ---- Error taxonomy (shared by all three routes) ----
 export const ApiErrorCodeSchema = z.enum([
-  "invalid_request", // body failed zod validation
-  "sql_rejected",    // sqlGuard rejected the SQL
-  "llm_error",       // OpenAI call failed / unusable output
-  "query_timeout",   // statement_timeout fired (pg code 57014)
-  "query_failed",    // any other Postgres error
+  "invalid_request",    // body failed zod validation
+  "sql_rejected",       // sqlGuard rejected the SQL
+  "llm_error",          // OpenAI call failed / unusable output
+  "query_timeout",      // statement_timeout fired (pg code 57014)
+  "query_failed",       // any other Postgres error
+  "connection_failed",  // onboarding / connection resolution failed
+  "not_found",          // resource doesn't exist or isn't yours
   "internal_error",
 ]);
 export type ApiErrorCode = z.infer<typeof ApiErrorCodeSchema>;
