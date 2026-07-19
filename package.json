@@ -33,13 +33,15 @@
     "build": "next build --turbopack",
     "start": "next start",
     "lint": "eslint",
-    "introspect": "node scripts/introspect-schema.mjs",
+    "introspect": "tsx scripts/introspect-schema.ts",
     "test:sqlguard": "tsx scripts/test-sqlguard.ts",
     "test:prompt": "tsx scripts/test-prompt.ts",
     "test": "tsx scripts/test-sqlguard.ts && tsx scripts/test-prompt.ts"
   },
   "dependencies": {
+    "better-sqlite3": "^12.11.1",
     "html-to-image": "^1.11.13",
+    "libpg-query": "^17.7.3",
     "next": "15.5.20",
     "openai": "^5.23.2",
     "pg": "^8.22.0",
@@ -51,6 +53,7 @@
   "devDependencies": {
     "@eslint/eslintrc": "^3",
     "@tailwindcss/postcss": "^4",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20",
     "@types/pg": "^8.20.0",
     "@types/react": "^19",

@@ -43,3 +43,7 @@ next-env.d.ts
 
 # generated locally from your database (schema + sampled values) — never commit
 db/schema-context.md
+
+# app-local data: metadata store (users/connections/dashboards/examples) and
+# the auto-generated credential-encryption key — never commit
+.data/
