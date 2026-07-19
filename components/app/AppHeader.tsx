@@ -1,26 +1,34 @@
 import Link from 'next/link';
+import type { ReactNode } from 'react';
 
 // App shell header — same visual language as the marketing nav (sticky, cream
 // blur, mono wordmark) so moving from the site into the product feels seamless.
-export function AppHeader() {
+// `slot` renders app-page controls (e.g. the connection picker).
+export function AppHeader({ slot }: { slot?: ReactNode }) {
   return (
     <header
       className="sticky top-0 z-50 border-b border-line"
       style={{ background: 'rgba(244,241,234,.82)', backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)' }}
     >
-      <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3.5">
-        <Link href="/" className="font-mono text-base font-semibold text-ink">
+      <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-6 py-3.5">
+        <Link href="/app" className="font-mono text-base font-semibold text-ink">
           prompt<span className="text-brand">→</span>dashboard
         </Link>
-        <div className="flex items-center gap-5">
-          <span className="hidden items-center gap-2 font-mono text-xs text-faint sm:flex">
-            <span className="relative flex h-2 w-2">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-brand-soft opacity-70" />
-              <span className="relative inline-flex h-2 w-2 rounded-full bg-brand" />
-            </span>
-            Connected to your data
-          </span>
-          <Link href="/" className="text-sm font-semibold text-muted transition-colors hover:text-brand">
+        <div className="flex min-w-0 items-center gap-5">
+          {slot}
+          <Link
+            href="/app/dashboards"
+            className="text-sm font-semibold text-muted transition-colors hover:text-brand"
+          >
+            Saved
+          </Link>
+          <Link
+            href="/app/connect"
+            className="hidden text-sm font-semibold text-muted transition-colors hover:text-brand sm:block"
+          >
+            Connect
+          </Link>
+          <Link href="/" className="hidden text-sm font-semibold text-muted transition-colors hover:text-brand sm:block">
             Exit to site
           </Link>
         </div>

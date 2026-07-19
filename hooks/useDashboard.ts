@@ -45,6 +45,8 @@ export function useDashboard() {
   const dashboardControllerRef = useRef<AbortController | null>(null);
   const panelControllersRef = useRef<Map<string, AbortController>>(new Map());
   const currentQuestionRef = useRef('');
+  // Which connection every API call targets; null = the env-configured one.
+  const connectionIdRef = useRef<string | null>(null);
   // Completed turns, oldest first — sent with every /api/dashboard request.
   const historyRef = useRef<HistoryTurn[]>([]);
   // Mirror of state for reads inside async callbacks (submit closures).
@@ -91,7 +93,7 @@ export function useDashboard() {
         const res = await fetch('/api/panel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sql, chartType: panel.chartType }),
+          body: JSON.stringify({ sql, chartType: panel.chartType, connectionId: connectionIdRef.current }),
           signal,
         });
         const body = await res.json().catch(() => null);
@@ -131,7 +133,10 @@ export function useDashboard() {
         const res = await fetch('/api/repair', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ question: currentQuestionRef.current, panel, sql, errorMessage }),
+          body: JSON.stringify({
+            question: currentQuestionRef.current, panel, sql, errorMessage,
+            connectionId: connectionIdRef.current,
+          }),
           signal,
         });
         if (!res.ok) throw new Error('repair failed');
@@ -180,7 +185,9 @@ export function useDashboard() {
         const res = await fetch('/api/dashboard', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ question, history: historyRef.current }),
+          body: JSON.stringify({
+            question, history: historyRef.current, connectionId: connectionIdRef.current,
+          }),
           signal: controller.signal,
         });
         if (!res.ok) {
@@ -258,5 +265,74 @@ export function useDashboard() {
 
   const retry = useCallback(() => submit(currentQuestionRef.current), [submit]);
 
-  return { ...state, submit, reset, retry };
+  // Point subsequent requests at a different connection. The conversation is
+  // reset: history against one database makes no sense against another.
+  const setConnectionId = useCallback(
+    (id: string | null) => {
+      if (id !== connectionIdRef.current) {
+        connectionIdRef.current = id;
+        reset();
+      }
+    },
+    [reset]
+  );
+
+  // Persist the dashboard currently on screen (each panel with the SQL that
+  // actually ran, post-repair). Returns the saved dashboard's id.
+  const save = useCallback(async (title: string): Promise<string> => {
+    const s = stateRef.current;
+    if (!s.spec) throw new Error('nothing to save');
+    const panels = s.spec.panels.map((p) => ({ ...p, sql: s.panels[p.id]?.sql ?? p.sql }));
+    const readyPanelIds = s.spec.panels.filter((p) => s.panels[p.id]?.status === 'ready').map((p) => p.id);
+    const res = await fetch('/api/dashboards', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        connectionId: connectionIdRef.current,
+        title,
+        question: currentQuestionRef.current,
+        spec: { mode: s.spec.mode, title: s.spec.title, summary: s.spec.summary, panels },
+        history: historyRef.current,
+        readyPanelIds,
+      }),
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok || !body?.dashboard?.id) {
+      throw new Error(body?.error?.friendlyMessage ?? 'Saving failed. Please try again.');
+    }
+    return body.dashboard.id as string;
+  }, []);
+
+  // Reopen a saved dashboard: restore spec + conversation history + the
+  // connection, then re-run every panel through the normal /api/panel path
+  // (the saved artifact is the spec; the data stays live).
+  const loadSaved = useCallback(
+    (saved: {
+      question: string;
+      connectionId: string | null;
+      spec: DashboardSpecWithIds;
+      history: HistoryTurn[];
+    }) => {
+      abortAll();
+      connectionIdRef.current = saved.connectionId;
+      historyRef.current = saved.history;
+      const question = saved.question || saved.history[saved.history.length - 1]?.question || '';
+      currentQuestionRef.current = question;
+
+      const initialPanels: Record<string, PanelState> = {};
+      for (const p of saved.spec.panels) {
+        initialPanels[p.id] = { status: 'loading', sql: p.sql };
+      }
+      setState({ phase: 'rendering', question, spec: saved.spec, panels: initialPanels, dashboardError: null });
+
+      for (const p of saved.spec.panels) {
+        const panelController = new AbortController();
+        panelControllersRef.current.set(p.id, panelController);
+        runPanel(p, panelController.signal);
+      }
+    },
+    [abortAll, runPanel]
+  );
+
+  return { ...state, submit, reset, retry, setConnectionId, save, loadSaved };
 }

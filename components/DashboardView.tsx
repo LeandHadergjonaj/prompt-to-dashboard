@@ -5,9 +5,19 @@ import type { PanelState } from '@/hooks/useDashboard';
 import { PanelCard } from './PanelCard';
 import { DownloadMenu } from './DownloadMenu';
 
+export type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
+
 export function DashboardView({
-  spec, question, panels, debug, onStartOver,
-}: { spec: DashboardSpecWithIds; question: string; panels: Record<string, PanelState>; debug: boolean; onStartOver: () => void }) {
+  spec, question, panels, debug, onStartOver, onSave, saveStatus = 'idle',
+}: {
+  spec: DashboardSpecWithIds;
+  question: string;
+  panels: Record<string, PanelState>;
+  debug: boolean;
+  onStartOver: () => void;
+  onSave?: () => void;
+  saveStatus?: SaveStatus;
+}) {
   // PNG capture target: header + grid, minus anything marked data-no-export.
   const captureRef = useRef<HTMLDivElement>(null);
   const allSettled = spec.panels.every((p) => {
@@ -26,6 +36,16 @@ export function DashboardView({
           <p className="mt-2 max-w-2xl text-base leading-relaxed text-muted">{spec.summary}</p>
         </div>
         <div className="flex shrink-0 items-center gap-2.5" data-no-export>
+          {onSave && (
+            <button
+              type="button"
+              onClick={onSave}
+              disabled={!allSettled || saveStatus === 'saving' || saveStatus === 'saved'}
+              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-line-strong px-4 py-2 text-sm font-semibold text-ink transition-colors hover:border-brand hover:text-brand disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'saved' ? 'Saved ✓' : saveStatus === 'error' ? 'Retry save' : 'Save'}
+            </button>
+          )}
           <DownloadMenu
             spec={spec}
             question={question}
