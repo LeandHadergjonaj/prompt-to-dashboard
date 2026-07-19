@@ -1,5 +1,4 @@
 import { Pool, types } from "pg";
-import { env } from "./env";
 import { wrapForExecution } from "./sqlGuard";
 import type { ColumnMeta } from "./types";
 
@@ -15,13 +14,15 @@ types.setTypeParser(1184, (v: string) => {
 
 // TLS comes from the connection string's sslmode parameter
 // (disable | require | no-verify | verify-full).
-export const pool = new Pool({
-  connectionString: env.DATABASE_URL_READONLY,
-  max: 5,
-  idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 10_000,
-  statement_timeout: 19_000, // just under the role's 20s backstop
-});
+export function createReaderPool(connectionString: string): Pool {
+  return new Pool({
+    connectionString,
+    max: 3,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
+    statement_timeout: 19_000, // just under the role's 20s backstop
+  });
+}
 
 const NUMBER_OIDS = new Set([20, 21, 23, 700, 701, 1700]);
 const DATE_OIDS = new Set([1082, 1114, 1184]);
@@ -43,7 +44,7 @@ export interface PanelQueryResult {
 const WRAP_LIMIT = 5001;
 const DISPLAY_LIMIT = 5000;
 
-export async function executePanelQuery(sanitizedSql: string): Promise<PanelQueryResult> {
+export async function executePanelQuery(pool: Pool, sanitizedSql: string): Promise<PanelQueryResult> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN TRANSACTION READ ONLY");
