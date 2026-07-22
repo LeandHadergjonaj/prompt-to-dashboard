@@ -76,6 +76,35 @@ export async function saveExamples(
 }
 
 /**
+ * Group a saved dashboard's READY panels by their effective connection
+ * (panel override, else the dashboard default) and persist each group's
+ * (question -> SQL) pairs. Best-effort: failures never fail the save.
+ */
+export async function capturePanelExamples(
+  userId: string,
+  defaultKey: string,
+  panels: Array<{ id: string; title: string; description: string; sql: string; connectionId: string | null }>,
+  readyPanelIds: string[]
+): Promise<void> {
+  const readyIds = new Set(readyPanelIds);
+  const byConnection = new Map<string, FewShotExample[]>();
+  for (const p of panels) {
+    if (!readyIds.has(p.id)) continue;
+    const key = p.connectionId ?? defaultKey;
+    const list = byConnection.get(key) ?? [];
+    list.push({ question: `${p.title}: ${p.description}`, sql: p.sql });
+    byConnection.set(key, list);
+  }
+  for (const [key, pairs] of byConnection) {
+    try {
+      await saveExamples(userId, key, pairs);
+    } catch {
+      // ignore — example capture is best-effort
+    }
+  }
+}
+
+/**
  * Retrieve the most similar accepted pairs for a new question. Returns []
  * whenever anything is missing or fails — retrieval must never block or
  * fail a generation request.

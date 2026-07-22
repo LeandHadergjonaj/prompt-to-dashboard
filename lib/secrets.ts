@@ -20,6 +20,12 @@ let secretMaterial: Buffer | null = null;
 function getSecretMaterial(): Buffer {
   if (secretMaterial) return secretMaterial;
   if (env.APP_SECRET) {
+    if (Buffer.byteLength(env.APP_SECRET, "utf8") < 16) {
+      throw new Error(
+        "APP_SECRET must be at least 16 characters — it protects stored database credentials. " +
+          "Generate one with: openssl rand -base64 32"
+      );
+    }
     secretMaterial = Buffer.from(env.APP_SECRET, "utf8");
     return secretMaterial;
   }

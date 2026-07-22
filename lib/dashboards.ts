@@ -94,13 +94,28 @@ export function saveDashboard(params: {
   return getDashboard(params.userId, id)!;
 }
 
-export function renameDashboard(userId: string, id: string, title: string): boolean {
+export function updateDashboard(
+  userId: string,
+  id: string,
+  changes: { title?: string; spec?: SavedSpec; history?: HistoryTurn[] }
+): boolean {
+  const sets: string[] = ["updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"];
+  const values: unknown[] = [];
+  if (changes.title !== undefined) {
+    sets.push("title = ?");
+    values.push(changes.title);
+  }
+  if (changes.spec !== undefined) {
+    sets.push("spec_json = ?", "summary = ?");
+    values.push(JSON.stringify(changes.spec), changes.spec.summary);
+  }
+  if (changes.history !== undefined) {
+    sets.push("history_json = ?");
+    values.push(JSON.stringify(changes.history));
+  }
   const result = getAppStore()
-    .prepare(
-      `UPDATE dashboards SET title = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       WHERE id = ? AND user_id = ?`
-    )
-    .run(title, id, userId);
+    .prepare(`UPDATE dashboards SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`)
+    .run(...values, id, userId);
   return result.changes > 0;
 }
 

@@ -17,6 +17,98 @@ interface ConnectionListItem {
   name: string;
 }
 
+interface AdviceSuggestion {
+  title: string;
+  ddl: string | null;
+  rationale: string;
+}
+
+interface AdvisorReport {
+  totalRuns: number;
+  timeouts: number;
+  avgDurationMs: number;
+  suggestions: AdviceSuggestion[];
+  source: 'llm' | 'fallback' | 'none';
+}
+
+// Per-connection performance card: read-only suggestions computed from local
+// query telemetry. The DDL shown is for the USER to run as an admin — the
+// app never executes it.
+function PerformanceCard({ connection }: { connection: ConnectionListItem }) {
+  const [state, setState] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [report, setReport] = useState<AdvisorReport | null>(null);
+
+  const load = async () => {
+    setState('loading');
+    try {
+      const res = await fetch(`/api/connections/${connection.id}/advice`);
+      const body = await res.json();
+      if (!res.ok || !body?.advice) throw new Error();
+      setReport(body.advice as AdvisorReport);
+      setState('idle');
+    } catch {
+      setState('error');
+    }
+  };
+
+  return (
+    <li className="rounded-xl border border-line bg-white px-5 py-4">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold text-ink">{connection.name}</div>
+          {report && report.source !== 'none' && (
+            <div className="mt-0.5 font-mono text-[11px] text-faint">
+              {report.totalRuns} recent queries · {report.timeouts} timed out · avg{' '}
+              {Math.round(report.avgDurationMs)} ms
+            </div>
+          )}
+        </div>
+        {!report && (
+          <button
+            type="button"
+            onClick={load}
+            disabled={state === 'loading'}
+            className="shrink-0 rounded-lg border border-line-strong px-3 py-1.5 text-xs font-semibold text-ink transition-colors hover:border-brand hover:text-brand disabled:opacity-60"
+          >
+            {state === 'loading' ? 'Analyzing…' : 'Performance advice'}
+          </button>
+        )}
+      </div>
+      {state === 'error' && (
+        <p className="mt-2 text-xs text-warm">Couldn’t build advice right now — try again in a moment.</p>
+      )}
+      {report && report.source === 'none' && (
+        <p className="mt-2 text-xs leading-relaxed text-muted">
+          Not enough query history yet. Build a few dashboards against this connection first.
+        </p>
+      )}
+      {report && report.suggestions.length > 0 && (
+        <ul className="mt-3 flex flex-col gap-3">
+          {report.suggestions.map((s, i) => (
+            <li key={i} className="rounded-lg border border-line bg-panel-2 p-3">
+              <div className="text-xs font-semibold text-ink">{s.title}</div>
+              <p className="mt-1 text-xs leading-relaxed text-muted">{s.rationale}</p>
+              {s.ddl && (
+                <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded-md bg-white p-2 font-mono text-[11px] text-muted-2">
+                  {s.ddl}
+                </pre>
+              )}
+            </li>
+          ))}
+          <li className="text-[11px] leading-snug text-faint">
+            Run these yourself as a database admin — this app never modifies your database.
+          </li>
+        </ul>
+      )}
+      {report && report.source !== 'none' && report.suggestions.length === 0 && (
+        <p className="mt-2 text-xs leading-relaxed text-muted">
+          Nothing to suggest — recent queries against this connection are running fine.
+        </p>
+      )}
+    </li>
+  );
+}
+
 export default function SavedDashboardsPage() {
   const [dashboards, setDashboards] = useState<DashboardListItem[] | null>(null);
   const [connections, setConnections] = useState<ConnectionListItem[]>([]);
@@ -116,6 +208,19 @@ export default function SavedDashboardsPage() {
               </li>
             ))}
           </ul>
+        )}
+
+        {connections.length > 0 && (
+          <div className="mt-12">
+            <div className="font-mono text-xs font-semibold uppercase tracking-[.16em] text-brand">
+              Connection performance
+            </div>
+            <ul className="mt-4 flex flex-col gap-3">
+              {connections.map((c) => (
+                <PerformanceCard key={c.id} connection={c} />
+              ))}
+            </ul>
+          </div>
         )}
       </div>
     </div>

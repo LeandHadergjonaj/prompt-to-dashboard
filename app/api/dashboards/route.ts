@@ -3,7 +3,7 @@ import { SaveDashboardRequestSchema } from "@/lib/types";
 import { getCurrentUserId } from "@/lib/identity";
 import { listDashboards, saveDashboard } from "@/lib/dashboards";
 import { getConnectionSummary, ENV_CONNECTION_ID, hasEnvConnection } from "@/lib/connections";
-import { saveExamples } from "@/lib/examples";
+import { capturePanelExamples } from "@/lib/examples";
 import { errorResponse } from "@/lib/apiErrors";
 
 export async function GET() {
@@ -25,14 +25,22 @@ export async function POST(req: NextRequest) {
     return errorResponse(400, "invalid_request", "That save request wasn't valid.", parsed.error.message);
   }
 
-  // The dashboard must reference a connection this user can actually use.
+  // The dashboard must reference connections this user can actually use —
+  // the dashboard-level default AND every per-panel override.
   const { connectionId } = parsed.data;
-  if (connectionId === null || connectionId === ENV_CONNECTION_ID) {
-    if (!hasEnvConnection()) {
-      return errorResponse(400, "connection_failed", "No database is connected for this dashboard.", null);
+  const defaultKey = connectionId ?? ENV_CONNECTION_ID;
+  const referencedKeys = new Set<string>([
+    defaultKey,
+    ...parsed.data.spec.panels.map((p) => p.connectionId ?? defaultKey),
+  ]);
+  for (const key of referencedKeys) {
+    if (key === ENV_CONNECTION_ID) {
+      if (!hasEnvConnection()) {
+        return errorResponse(400, "connection_failed", "No database is connected for this dashboard.", null);
+      }
+    } else if (!getConnectionSummary(userId, key)) {
+      return errorResponse(404, "not_found", "A database connection this dashboard uses no longer exists.", null);
     }
-  } else if (!getConnectionSummary(userId, connectionId)) {
-    return errorResponse(404, "not_found", "That database connection no longer exists.", null);
   }
 
   const saved = saveDashboard({
@@ -45,16 +53,9 @@ export async function POST(req: NextRequest) {
   });
 
   // Accept signal: panels that rendered successfully become few-shot
-  // examples for this connection. Failures here never fail the save.
-  const readyIds = new Set(parsed.data.readyPanelIds);
-  const pairs = parsed.data.spec.panels
-    .filter((p) => readyIds.has(p.id))
-    .map((p) => ({ question: `${p.title}: ${p.description}`, sql: p.sql }));
-  try {
-    await saveExamples(userId, connectionId ?? ENV_CONNECTION_ID, pairs);
-  } catch {
-    // ignore — example capture is best-effort
-  }
+  // examples, each attributed to the PANEL's effective connection.
+  // Failures here never fail the save.
+  await capturePanelExamples(userId, defaultKey, parsed.data.spec.panels, parsed.data.readyPanelIds);
 
   return NextResponse.json({ dashboard: saved }, { status: 201 });
 }

@@ -12,7 +12,9 @@ export interface PanelState {
   columns?: ColumnMeta[];
   rows?: unknown[][];
   truncated?: boolean;
-  error?: { friendlyMessage: string; debug?: string | null };
+  // `code` is the API error code (e.g. 'query_timeout') — drives the
+  // distinct timeout treatment on the panel error card.
+  error?: { friendlyMessage: string; debug?: string | null; code?: string };
 }
 
 interface DashboardState {
@@ -45,10 +47,19 @@ export function useDashboard() {
   const dashboardControllerRef = useRef<AbortController | null>(null);
   const panelControllersRef = useRef<Map<string, AbortController>>(new Map());
   const currentQuestionRef = useRef('');
-  // Which connection every API call targets; null = the env-configured one.
+  // The PRIMARY connection; null = the env-configured one. Panels may
+  // override it with their own connectionId ('env' or a connection id).
   const connectionIdRef = useRef<string | null>(null);
+  // Additional comparison sources ('env' or connection ids, never the
+  // primary). Changing these does NOT reset the conversation — existing
+  // panels keep their own sources, so history stays valid.
+  const extraConnectionIdsRef = useRef<string[]>([]);
   // Completed turns, oldest first — sent with every /api/dashboard request.
   const historyRef = useRef<HistoryTurn[]>([]);
+  // Saved-dashboard id this conversation belongs to; save() updates it in
+  // place (PATCH) instead of creating a copy. Cleared when the conversation
+  // moves to an unrelated dashboard.
+  const savedIdRef = useRef<string | null>(null);
   // Mirror of state for reads inside async callbacks (submit closures).
   const stateRef = useRef(state);
   useEffect(() => { stateRef.current = state; });
@@ -85,6 +96,14 @@ export function useDashboard() {
     }
   }, []);
 
+  // The connection a panel actually queries: its own override, else the
+  // conversation's primary ('env' when the primary is the env connection —
+  // the server treats 'env' and null identically).
+  const effectiveConnectionId = useCallback(
+    (panel: PanelWithId) => panel.connectionId ?? connectionIdRef.current ?? 'env',
+    []
+  );
+
   const runPanel = useCallback(
     async (panel: PanelWithId, signal: AbortSignal, sqlOverride?: string, isRepairRun = false) => {
       const sql = sqlOverride ?? panel.sql;
@@ -93,7 +112,7 @@ export function useDashboard() {
         const res = await fetch('/api/panel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sql, chartType: panel.chartType, connectionId: connectionIdRef.current }),
+          body: JSON.stringify({ sql, chartType: panel.chartType, connectionId: effectiveConnectionId(panel) }),
           signal,
         });
         const body = await res.json().catch(() => null);
@@ -106,13 +125,16 @@ export function useDashboard() {
         const errBody: ApiErrorShape | undefined = body?.error;
         const friendlyMessage = errBody?.friendlyMessage ?? GENERIC_PANEL_ERROR;
         if (isRepairRun) {
-          setPanel(panel.id, { status: 'failed', error: { friendlyMessage, debug: errBody?.debug } });
+          setPanel(panel.id, {
+            status: 'failed',
+            error: { friendlyMessage, debug: errBody?.debug, code: errBody?.code },
+          });
           maybeFinish();
           return;
         }
         // Raw DB error lives in debug — that's what the repair prompt needs.
         const rawError = (errBody?.debug ?? errBody?.friendlyMessage ?? 'unknown error').slice(0, 2000);
-        await attemptRepair(panel, signal, sql, rawError);
+        await attemptRepair(panel, signal, sql, rawError, errBody?.code ?? null);
       } catch (err) {
         if ((err as { name?: string }).name === 'AbortError') return;
         if (isRepairRun) {
@@ -120,22 +142,22 @@ export function useDashboard() {
           maybeFinish();
           return;
         }
-        await attemptRepair(panel, signal, sql, 'network error');
+        await attemptRepair(panel, signal, sql, 'network error', null);
       }
     },
-    [setPanel, maybeFinish, patchHistorySql] // eslint-disable-line react-hooks/exhaustive-deps
+    [setPanel, maybeFinish, patchHistorySql, effectiveConnectionId] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   const attemptRepair = useCallback(
-    async (panel: PanelWithId, signal: AbortSignal, sql: string, errorMessage: string) => {
+    async (panel: PanelWithId, signal: AbortSignal, sql: string, errorMessage: string, errorCode: string | null) => {
       setPanel(panel.id, { status: 'repairing' });
       try {
         const res = await fetch('/api/repair', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            question: currentQuestionRef.current, panel, sql, errorMessage,
-            connectionId: connectionIdRef.current,
+            question: currentQuestionRef.current, panel, sql, errorMessage, errorCode,
+            connectionId: effectiveConnectionId(panel),
           }),
           signal,
         });
@@ -144,11 +166,14 @@ export function useDashboard() {
         await runPanel(panel, signal, repairedSql, true);
       } catch (err) {
         if ((err as { name?: string }).name === 'AbortError') return;
-        setPanel(panel.id, { status: 'failed', error: { friendlyMessage: GENERIC_PANEL_ERROR } });
+        setPanel(panel.id, {
+          status: 'failed',
+          error: { friendlyMessage: GENERIC_PANEL_ERROR, code: errorCode ?? undefined },
+        });
         maybeFinish();
       }
     },
-    [setPanel, runPanel, maybeFinish]
+    [setPanel, runPanel, maybeFinish, effectiveConnectionId]
   );
 
   const submit = useCallback(
@@ -159,14 +184,15 @@ export function useDashboard() {
       const prev = stateRef.current;
       const hasVisible = prev.spec !== null && (prev.phase === 'rendering' || prev.phase === 'done');
 
-      // Results from the visible dashboard, keyed by the SQL that produced
-      // them — a follow-up panel with byte-identical SQL reuses them without
-      // re-querying.
+      // Results from the visible dashboard, keyed by (connection, SQL) — a
+      // follow-up panel with byte-identical SQL against the same source
+      // reuses them without re-querying.
+      const cacheKey = (conn: string, sql: string) => `${conn} ${sql.trim()}`;
       const cachedBySql = new Map<string, PanelState>();
       if (hasVisible && prev.spec) {
         for (const p of prev.spec.panels) {
           const st = prev.panels[p.id];
-          if (st?.status === 'ready') cachedBySql.set(st.sql.trim(), st);
+          if (st?.status === 'ready') cachedBySql.set(cacheKey(effectiveConnectionId(p), st.sql), st);
         }
       }
 
@@ -182,11 +208,14 @@ export function useDashboard() {
       const controller = new AbortController();
       dashboardControllerRef.current = controller;
       try {
+        const primary = connectionIdRef.current ?? 'env';
+        const connectionIds = [primary, ...extraConnectionIdsRef.current.filter((id) => id !== primary)];
         const res = await fetch('/api/dashboard', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            question, history: historyRef.current, connectionId: connectionIdRef.current,
+            question, history: historyRef.current,
+            connectionId: connectionIdRef.current, connectionIds,
           }),
           signal: controller.signal,
         });
@@ -196,19 +225,24 @@ export function useDashboard() {
         }
         const { spec } = (await res.json()) as { spec: DashboardSpecWithIds };
 
+        // A fresh, unrelated dashboard must not overwrite the saved one.
+        if (spec.mode === 'new') savedIdRef.current = null;
+
         historyRef.current = [
           ...historyRef.current,
           {
             question,
             dashboardTitle: spec.title,
-            panels: spec.panels.map((p) => ({ title: p.title, chartType: p.chartType, sql: p.sql })),
+            panels: spec.panels.map((p) => ({
+              title: p.title, chartType: p.chartType, sql: p.sql, connectionId: p.connectionId,
+            })),
           },
         ].slice(-MAX_HISTORY_TURNS);
 
         const initialPanels: Record<string, PanelState> = {};
         const toFetch: PanelWithId[] = [];
         for (const p of spec.panels) {
-          const cached = cachedBySql.get(p.sql.trim());
+          const cached = cachedBySql.get(cacheKey(effectiveConnectionId(p), p.sql));
           if (cached) {
             initialPanels[p.id] = {
               status: 'ready', sql: cached.sql,
@@ -253,20 +287,22 @@ export function useDashboard() {
         }
       }
     },
-    [abortAll, runPanel]
+    [abortAll, runPanel, effectiveConnectionId]
   );
 
   const reset = useCallback(() => {
     abortAll();
     historyRef.current = [];
     currentQuestionRef.current = '';
+    savedIdRef.current = null;
     setState({ phase: 'idle', question: '', spec: null, panels: {}, dashboardError: null });
   }, [abortAll]);
 
   const retry = useCallback(() => submit(currentQuestionRef.current), [submit]);
 
-  // Point subsequent requests at a different connection. The conversation is
-  // reset: history against one database makes no sense against another.
+  // Point subsequent requests at a different PRIMARY connection. The
+  // conversation is reset: history against one database makes no sense
+  // against another.
   const setConnectionId = useCallback(
     (id: string | null) => {
       if (id !== connectionIdRef.current) {
@@ -277,29 +313,57 @@ export function useDashboard() {
     [reset]
   );
 
+  // Add/remove comparison sources. Unlike switching the primary, this keeps
+  // the conversation — existing panels keep their own sources.
+  const setExtraConnectionIds = useCallback((ids: string[]) => {
+    const primary = connectionIdRef.current ?? 'env';
+    extraConnectionIdsRef.current = [...new Set(ids.filter((id) => id !== primary))];
+  }, []);
+
+  // Timeout recovery: honestly re-plan the panel through /api/dashboard with
+  // a synthetic follow-up turn — never string-edit SQL client-side.
+  const narrowPanel = useCallback(
+    (panel: PanelWithId) => {
+      void submit(`Restrict the "${panel.title}" panel to the most recent 90 days of data`);
+    },
+    [submit]
+  );
+
   // Persist the dashboard currently on screen (each panel with the SQL that
-  // actually ran, post-repair). Returns the saved dashboard's id.
+  // actually ran, post-repair). First save creates it; saving again in the
+  // same conversation (or after reopening) updates it in place. Returns the
+  // saved dashboard's id.
   const save = useCallback(async (title: string): Promise<string> => {
     const s = stateRef.current;
     if (!s.spec) throw new Error('nothing to save');
     const panels = s.spec.panels.map((p) => ({ ...p, sql: s.panels[p.id]?.sql ?? p.sql }));
     const readyPanelIds = s.spec.panels.filter((p) => s.panels[p.id]?.status === 'ready').map((p) => p.id);
-    const res = await fetch('/api/dashboards', {
-      method: 'POST',
+    const spec = { mode: s.spec.mode, title: s.spec.title, summary: s.spec.summary, panels };
+
+    const savedId = savedIdRef.current;
+    const res = await fetch(savedId ? `/api/dashboards/${savedId}` : '/api/dashboards', {
+      method: savedId ? 'PATCH' : 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        connectionId: connectionIdRef.current,
-        title,
-        question: currentQuestionRef.current,
-        spec: { mode: s.spec.mode, title: s.spec.title, summary: s.spec.summary, panels },
-        history: historyRef.current,
-        readyPanelIds,
-      }),
+      body: JSON.stringify(
+        savedId
+          ? { title, spec, history: historyRef.current, readyPanelIds }
+          : {
+              connectionId: connectionIdRef.current,
+              title,
+              question: currentQuestionRef.current,
+              spec,
+              history: historyRef.current,
+              readyPanelIds,
+            }
+      ),
     });
     const body = await res.json().catch(() => null);
     if (!res.ok || !body?.dashboard?.id) {
+      // A stale id (dashboard deleted elsewhere) shouldn't wedge saving.
+      if (savedId && res.status === 404) savedIdRef.current = null;
       throw new Error(body?.error?.friendlyMessage ?? 'Saving failed. Please try again.');
     }
+    savedIdRef.current = body.dashboard.id as string;
     return body.dashboard.id as string;
   }, []);
 
@@ -308,13 +372,25 @@ export function useDashboard() {
   // (the saved artifact is the spec; the data stays live).
   const loadSaved = useCallback(
     (saved: {
+      id: string;
       question: string;
       connectionId: string | null;
       spec: DashboardSpecWithIds;
       history: HistoryTurn[];
     }) => {
       abortAll();
+      savedIdRef.current = saved.id;
       connectionIdRef.current = saved.connectionId;
+      // Rebuild the comparison-source set from the panels' own connections
+      // so follow-up turns still see every source this dashboard uses.
+      const primary = saved.connectionId ?? 'env';
+      extraConnectionIdsRef.current = [
+        ...new Set(
+          saved.spec.panels
+            .map((p) => p.connectionId)
+            .filter((c): c is string => c !== null && c !== primary)
+        ),
+      ];
       historyRef.current = saved.history;
       const question = saved.question || saved.history[saved.history.length - 1]?.question || '';
       currentQuestionRef.current = question;
@@ -334,5 +410,8 @@ export function useDashboard() {
     [abortAll, runPanel]
   );
 
-  return { ...state, submit, reset, retry, setConnectionId, save, loadSaved };
+  return {
+    ...state, submit, reset, retry, setConnectionId, setExtraConnectionIds,
+    narrowPanel, save, loadSaved,
+  };
 }

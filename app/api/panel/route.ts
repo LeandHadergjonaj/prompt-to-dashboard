@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { PanelRequestSchema, type PanelResponse } from "@/lib/types";
 import { checkSql } from "@/lib/sqlGuard";
-import { executePanelQuery } from "@/lib/db";
+import { executePanelQuery, explainQueryCost } from "@/lib/db";
 import { getCurrentUserId } from "@/lib/identity";
 import { getExecutionContext, ConnectionError } from "@/lib/connections";
 import { errorResponse, connectionErrorResponse } from "@/lib/apiErrors";
 import { SchemaContextMissingError } from "@/lib/schemaContext";
+import { recordPanelRun } from "@/lib/telemetry";
 
 export async function POST(req: NextRequest) {
   const userId = await getCurrentUserId();
@@ -34,6 +35,16 @@ export async function POST(req: NextRequest) {
 
   const guard = await checkSql(parsed.data.sql, context.catalog);
   if (!guard.ok) {
+    recordPanelRun({
+      userId,
+      connectionKey: context.connectionKey,
+      sql: parsed.data.sql,
+      durationMs: 0,
+      rowCount: null,
+      outcome: "rejected",
+      errorCode: null,
+      totalCost: null,
+    });
     return errorResponse(
       400,
       "sql_rejected",
@@ -42,13 +53,42 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  const maxRows = context.settings.maxResultRows;
+
+  // Cost guard stage 1 (warn-only): record the planner estimate alongside
+  // the outcome so per-connection (cost, duration, outcome) history
+  // accumulates. No action is taken on it yet — cost units are not portable
+  // across databases.
+  const totalCost = await explainQueryCost(context.pool, guard.sanitizedSql!, maxRows);
+
+  const started = performance.now();
   try {
-    const result = await executePanelQuery(context.pool, guard.sanitizedSql!);
+    const result = await executePanelQuery(context.pool, guard.sanitizedSql!, maxRows);
+    recordPanelRun({
+      userId,
+      connectionKey: context.connectionKey,
+      sql: guard.sanitizedSql!,
+      durationMs: performance.now() - started,
+      rowCount: result.rows.length,
+      outcome: "ok",
+      errorCode: null,
+      totalCost,
+    });
     const responseBody: PanelResponse = result;
     return NextResponse.json(responseBody, { status: 200 });
   } catch (err) {
     const pgCode = (err as { code?: string })?.code;
     const debug = err instanceof Error ? err.message : String(err);
+    recordPanelRun({
+      userId,
+      connectionKey: context.connectionKey,
+      sql: guard.sanitizedSql!,
+      durationMs: performance.now() - started,
+      rowCount: null,
+      outcome: pgCode === "57014" ? "timeout" : "error",
+      errorCode: pgCode ?? null,
+      totalCost,
+    });
 
     if (pgCode === "57014") {
       return errorResponse(

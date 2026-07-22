@@ -5,6 +5,11 @@ import type { SqlCatalog } from "./sqlGuard";
 //  - markdown: the LLM schema context (same format db/schema-context.md uses)
 //  - catalog:  table -> columns, for AST identifier binding
 //  - stats:    friendly numbers for the plain-English onboarding summary
+//
+// Large-database discipline: every data-sampling query (min/max date ranges,
+// value enumeration) runs under a session statement_timeout and is gated by
+// the table's approximate row count. One slow table degrades to a less
+// detailed note instead of hanging the whole onboarding request.
 
 export interface Queryable {
   query(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
@@ -38,13 +43,49 @@ const SKIP_VALUE_COLUMNS =
 const MAX_ENUM_VALUES = 24;
 const TOP_SAMPLE = 10;
 
+// Sampling bounds. Above ENUM_FULL_MAX_ROWS a full GROUP BY scan is replaced
+// by TABLESAMPLE; above ENUM_SAMPLE_MAX_ROWS value enumeration is skipped
+// entirely. reltuples can be stale — fine for a gate.
+const SAMPLE_STATEMENT_TIMEOUT = "5s";
+const ENUM_FULL_MAX_ROWS = 2_000_000;
+const ENUM_SAMPLE_MAX_ROWS = 50_000_000;
+
 function quoteIdent(s: string): string {
   return '"' + s.replace(/"/g, '""') + '"';
 }
 
+function isStatementTimeout(err: unknown): boolean {
+  return (err as { code?: string })?.code === "57014";
+}
+
+/** 1234 -> "1,234"; 40_120_000 -> "~40M" — keeps huge numbers readable in the prompt. */
+export function humanizeRowCount(n: number): string {
+  if (n < 10_000) return n.toLocaleString("en-US");
+  if (n < 1_000_000) return `~${Math.round(n / 1_000)}K`;
+  if (n < 1_000_000_000) return `~${(n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0).replace(/\.0$/, "")}M`;
+  return `~${(n / 1_000_000_000).toFixed(1).replace(/\.0$/, "")}B`;
+}
+
+const RELKIND_LABEL: Record<string, string> = {
+  v: "view",
+  m: "materialized view",
+  f: "foreign table — federated (remote): queries cross the network; prefer aggregation before joining",
+};
+
 export async function introspectDatabase(client: Queryable): Promise<IntrospectResult> {
   const dbRes = await client.query("SELECT current_database() AS db");
   const databaseName = String(dbRes.rows[0]?.db ?? "");
+
+  // Bound every sampling query below. This is OUR admin session, not guarded
+  // panel SQL (the AST guard still rejects SET from the model). If the
+  // server forbids it, sampling simply runs unbounded as before.
+  let sampleCapActive = false;
+  try {
+    await client.query(`SET statement_timeout = '${SAMPLE_STATEMENT_TIMEOUT}'`);
+    sampleCapActive = true;
+  } catch {
+    // continue without the cap
+  }
 
   // pg_class (not information_schema) so child partitions are excluded
   // generically: partitioned parents ('p') are listed, their partitions not.
@@ -110,7 +151,7 @@ export async function introspectDatabase(client: Queryable): Promise<IntrospectR
     stats.totalApproxRows += Math.max(0, approx);
 
     md += `### ${table_name}\n\n`;
-    md += `- Approximate row count: ${approx}\n`;
+    md += `- Approximate row count: ${humanizeRowCount(Math.max(0, approx))}\n`;
     md += `- Primary key: (${pk.rows.map((r) => r.column_name).join(", ") || "none"})\n\n`;
     md += `| Column | Type | Nullable |\n|---|---|---|\n`;
     for (const c of cols.rows) {
@@ -122,19 +163,41 @@ export async function introspectDatabase(client: Queryable): Promise<IntrospectR
     }
     md += `\n`;
 
+    const qTable = quoteIdent(table_name);
     for (const c of cols.rows) {
       const name = String(c.column_name);
       const type = String(c.data_type);
+      const qCol = quoteIdent(name);
 
       if (type === "date" || type.startsWith("timestamp")) {
-        const r = await client.query(
-          `SELECT min(${quoteIdent(name)})::text AS lo, max(${quoteIdent(name)})::text AS hi FROM ${quoteIdent(table_name)};`
-        );
-        if (r.rows[0]?.lo) {
-          const lo = String(r.rows[0].lo);
-          const hi = String(r.rows[0].hi);
-          valueNotes += `- ${table_name}.${name}: ranges ${lo} .. ${hi}\n`;
-          stats.dateRanges.push({ column: `${table_name}.${name}`, from: lo, to: hi });
+        // Plain min/max is instant with an index; on timeout fall back to a
+        // 1% block sample and mark the range approximate.
+        let range: { lo: string; hi: string; approximate: boolean } | null = null;
+        try {
+          const r = await client.query(
+            `SELECT min(${qCol})::text AS lo, max(${qCol})::text AS hi FROM ${qTable};`
+          );
+          if (r.rows[0]?.lo) {
+            range = { lo: String(r.rows[0].lo), hi: String(r.rows[0].hi), approximate: false };
+          }
+        } catch (err) {
+          if (!isStatementTimeout(err)) throw err;
+          try {
+            const r = await client.query(
+              `SELECT min(${qCol})::text AS lo, max(${qCol})::text AS hi FROM ${qTable} TABLESAMPLE SYSTEM (1);`
+            );
+            if (r.rows[0]?.lo) {
+              range = { lo: String(r.rows[0].lo), hi: String(r.rows[0].hi), approximate: true };
+            }
+          } catch {
+            valueNotes += `- ${table_name}.${name}: (skipped — table too large to sample)\n`;
+          }
+        }
+        if (range) {
+          valueNotes += `- ${table_name}.${name}: ranges ${range.lo} .. ${range.hi}${
+            range.approximate ? " (approximate — sampled)" : ""
+          }\n`;
+          stats.dateRanges.push({ column: `${table_name}.${name}`, from: range.lo, to: range.hi });
         }
         continue;
       }
@@ -143,17 +206,36 @@ export async function introspectDatabase(client: Queryable): Promise<IntrospectR
         (type === "text" || type === "boolean" || type === "character varying") &&
         !SKIP_VALUE_COLUMNS.test(name)
       ) {
-        const r = await client.query(
-          `SELECT ${quoteIdent(name)}::text AS v, count(*) AS n
-           FROM ${quoteIdent(table_name)}
-           WHERE ${quoteIdent(name)} IS NOT NULL
-           GROUP BY 1 ORDER BY n DESC LIMIT ${MAX_ENUM_VALUES + 1};`
-        );
-        if (r.rows.length === 0) continue;
-        if (r.rows.length <= MAX_ENUM_VALUES) {
-          valueNotes += `- ${table_name}.${name} (all values): ${r.rows.map((x) => JSON.stringify(x.v)).join(", ")}\n`;
+        if (approx > ENUM_SAMPLE_MAX_ROWS) {
+          valueNotes += `- ${table_name}.${name}: (skipped — table too large to sample)\n`;
+          continue;
+        }
+        const useSample = approx > ENUM_FULL_MAX_ROWS;
+        const source = useSample ? `${qTable} TABLESAMPLE SYSTEM (1)` : qTable;
+        let enumRows: { v: unknown }[];
+        try {
+          const r = await client.query(
+            `SELECT ${qCol}::text AS v, count(*) AS n
+             FROM ${source}
+             WHERE ${qCol} IS NOT NULL
+             GROUP BY 1 ORDER BY n DESC LIMIT ${MAX_ENUM_VALUES + 1};`
+          );
+          enumRows = r.rows as { v: unknown }[];
+        } catch (err) {
+          if (!isStatementTimeout(err) && !useSample) throw err;
+          // TABLESAMPLE is unsupported on some relations (e.g. partitioned
+          // parents on older PG); a timeout even under sampling means give up.
+          valueNotes += `- ${table_name}.${name}: (skipped — table too large to sample)\n`;
+          continue;
+        }
+        if (enumRows.length === 0) continue;
+        const sampledNote = useSample ? "; sampled" : "";
+        if (enumRows.length <= MAX_ENUM_VALUES) {
+          valueNotes += `- ${table_name}.${name} (all values${sampledNote}): ${enumRows
+            .map((x) => JSON.stringify(x.v))
+            .join(", ")}\n`;
         } else {
-          valueNotes += `- ${table_name}.${name} (high cardinality; most common): ${r.rows
+          valueNotes += `- ${table_name}.${name} (high cardinality; most common${sampledNote}): ${enumRows
             .slice(0, TOP_SAMPLE)
             .map((x) => JSON.stringify(x.v))
             .join(", ")}, ...\n`;
@@ -162,20 +244,51 @@ export async function introspectDatabase(client: Queryable): Promise<IntrospectR
     }
   }
 
-  md += `## Column value reference\n\nDistinct values for low-cardinality columns, top values for high-cardinality ones, and date ranges:\n\n${valueNotes}`;
-
-  // Binding catalog also admits views/materialized views/foreign tables:
-  // they are queryable even though the markdown documents plain tables only,
-  // so the guard must never reject them as "unknown".
+  // Views, materialized views and foreign tables: queryable, so they enter
+  // both the binding catalog AND the markdown with their real columns —
+  // views are precisely what admins create to make big data queryable, so
+  // the LLM must see them. (information_schema does not cover matviews;
+  // pg_attribute covers all three relkinds.)
   const { rows: extraRels } = await client.query(
-    `SELECT c.relname AS rel_name
+    `SELECT c.relname AS rel_name, c.relkind AS rel_kind,
+            GREATEST(c.reltuples::bigint, 0) AS approx_rows,
+            COALESCE(a.attname, '') AS col_name,
+            COALESCE(format_type(a.atttypid, a.atttypmod), '') AS col_type
      FROM pg_class c
      JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = 'public' AND c.relkind IN ('v', 'm', 'f');`
+     LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+     WHERE n.nspname = 'public' AND c.relkind IN ('v', 'm', 'f')
+     ORDER BY c.relname, a.attnum;`
   );
+  const extraByRel = new Map<string, { kind: string; approxRows: number; cols: { name: string; type: string }[] }>();
   for (const r of extraRels) {
     const rel = String(r.rel_name);
-    if (!catalog.tables[rel]) catalog.tables[rel] = [];
+    let entry = extraByRel.get(rel);
+    if (!entry) {
+      entry = { kind: String(r.rel_kind), approxRows: Number(r.approx_rows ?? 0), cols: [] };
+      extraByRel.set(rel, entry);
+    }
+    if (r.col_name) entry.cols.push({ name: String(r.col_name), type: String(r.col_type) });
+  }
+
+  if (extraByRel.size > 0) {
+    md += `## Views and derived relations\n\nThese are queryable exactly like tables:\n\n`;
+    for (const [rel, entry] of extraByRel) {
+      if (!catalog.tables[rel]) catalog.tables[rel] = entry.cols.map((c) => c.name);
+      md += `### ${rel} (${RELKIND_LABEL[entry.kind] ?? "relation"})\n\n`;
+      if (entry.kind === "m") {
+        md += `- Approximate row count: ${humanizeRowCount(entry.approxRows)}\n`;
+      }
+      md += `| Column | Type |\n|---|---|\n`;
+      for (const c of entry.cols) md += `| ${c.name} | ${c.type} |\n`;
+      md += `\n`;
+    }
+  }
+
+  md += `## Column value reference\n\nDistinct values for low-cardinality columns, top values for high-cardinality ones, and date ranges:\n\n${valueNotes}`;
+
+  if (sampleCapActive) {
+    await client.query("SET statement_timeout = DEFAULT").catch(() => {});
   }
 
   return { markdown: md, catalog, stats };

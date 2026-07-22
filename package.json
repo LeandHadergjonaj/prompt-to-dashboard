@@ -34,9 +34,11 @@
     "start": "next start",
     "lint": "eslint",
     "introspect": "tsx scripts/introspect-schema.ts",
+    "fixture:bigdb": "tsx scripts/fixture-bigdb.ts",
     "test:sqlguard": "tsx scripts/test-sqlguard.ts",
     "test:prompt": "tsx scripts/test-prompt.ts",
-    "test": "tsx scripts/test-sqlguard.ts && tsx scripts/test-prompt.ts"
+    "test:appstore": "tsx scripts/test-appstore.ts",
+    "test": "tsx scripts/test-sqlguard.ts && tsx scripts/test-prompt.ts && tsx scripts/test-appstore.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",

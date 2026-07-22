@@ -244,7 +244,10 @@ export function checkSqlKeyword(rawSql: string): SqlGuardResult {
 // Only ever call with SQL that just passed checkSql (trailing semicolon
 // already stripped — otherwise the wrap is syntactically invalid). A trailing
 // `--` line comment cannot swallow the closing paren because the wrap places
-// it on its own line.
-export function wrapForExecution(sanitizedSql: string): string {
-  return `SELECT * FROM (\n${sanitizedSql}\n) AS _panel LIMIT 5001`;
+// it on its own line. The wrap fetches one row past the cap so the executor
+// can tell "exactly maxRows" from "truncated".
+export const DEFAULT_MAX_RESULT_ROWS = 5000;
+
+export function wrapForExecution(sanitizedSql: string, maxRows: number = DEFAULT_MAX_RESULT_ROWS): string {
+  return `SELECT * FROM (\n${sanitizedSql}\n) AS _panel LIMIT ${maxRows + 1}`;
 }

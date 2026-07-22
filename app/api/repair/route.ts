@@ -38,6 +38,12 @@ export async function POST(req: NextRequest) {
     throw err;
   }
 
+  // Structured code from the client is authoritative; the message signature
+  // is the fallback for clients that don't send it.
+  const timedOut =
+    parsed.data.errorCode === "query_timeout" ||
+    /canceling statement due to statement timeout/i.test(parsed.data.errorMessage);
+
   let repairedSql: string;
   try {
     repairedSql = await repairSql({
@@ -46,6 +52,7 @@ export async function POST(req: NextRequest) {
       sql: parsed.data.sql,
       errorMessage: parsed.data.errorMessage,
       schemaContext: context.schemaContext,
+      timedOut,
     });
   } catch (err) {
     const debug = err instanceof Error ? err.message : String(err);

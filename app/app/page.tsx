@@ -23,15 +23,20 @@ interface ConnectionListItem {
 // the wire); anything else is a user-onboarded connection id.
 type SelectedConnection = string | null;
 
+const MAX_EXTRA_SOURCES = 2; // 3 sources total, primary included
+
 export default function AppPage() {
   const {
     phase, question, spec, panels, dashboardError,
-    submit, reset, retry, setConnectionId, save, loadSaved,
+    submit, reset, retry, setConnectionId, setExtraConnectionIds,
+    narrowPanel, save, loadSaved,
   } = useDashboard();
   const [debug, setDebug] = useState(false);
   const [connections, setConnections] = useState<ConnectionListItem[] | null>(null);
   const [envConnection, setEnvConnection] = useState(false);
   const [selected, setSelected] = useState<SelectedConnection>(null);
+  // Additional comparison sources ('env' or connection ids, never the primary).
+  const [extras, setExtras] = useState<string[]>([]);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [loadError, setLoadError] = useState<string | null>(null);
   const bootRef = useRef(false);
@@ -69,7 +74,17 @@ export default function AppPage() {
           }
           const d = body.dashboard;
           setSelected(d.connectionId ?? 'env');
+          // Restore comparison sources from the panels' own connections.
+          const primary = d.connectionId ?? 'env';
+          setExtras([
+            ...new Set(
+              (d.spec.panels as { connectionId?: string | null }[])
+                .map((p) => p.connectionId)
+                .filter((c): c is string => typeof c === 'string' && c !== primary)
+            ),
+          ]);
           loadSaved({
+            id: d.id,
             question: d.question,
             connectionId: d.connectionId,
             spec: d.spec,
@@ -97,6 +112,7 @@ export default function AppPage() {
   useEffect(() => {
     if (selected === null) return;
     setConnectionId(selected === 'env' ? null : selected);
+    setExtras((prev) => prev.filter((id) => id !== selected));
     const url = new URL(window.location.href);
     if (url.searchParams.get('c') !== selected) {
       url.searchParams.set('c', selected);
@@ -104,6 +120,12 @@ export default function AppPage() {
       window.history.replaceState(null, '', url.toString());
     }
   }, [selected, setConnectionId]);
+
+  // Comparison sources never reset the conversation — they only widen what
+  // the next question may draw from.
+  useEffect(() => {
+    setExtraConnectionIds(extras);
+  }, [extras, setExtraConnectionIds]);
 
   // A new or updated dashboard is unsaved again.
   useEffect(() => {
@@ -124,22 +146,79 @@ export default function AppPage() {
   const noConnectionAvailable =
     connections !== null && connections.length === 0 && !envConnection;
 
+  // Every selectable source: the env connection (when configured) + the
+  // user's own connections.
+  const allSources: ConnectionListItem[] = [
+    ...(envConnection ? [{ id: 'env', name: 'Built-in data' }] : []),
+    ...(connections ?? []),
+  ];
+  const sourceName = (id: string) => allSources.find((s) => s.id === id)?.name ?? 'Deleted connection';
+  const extraCandidates = allSources.filter((s) => s.id !== selected);
+
+  const toggleExtra = (id: string) =>
+    setExtras((prev) =>
+      prev.includes(id)
+        ? prev.filter((x) => x !== id)
+        : prev.length < MAX_EXTRA_SOURCES
+          ? [...prev, id]
+          : prev
+    );
+
   const picker =
-    connections !== null && (connections.length > 0 || envConnection) ? (
-      <select
-        value={selected ?? ''}
-        onChange={(e) => setSelected(e.target.value)}
-        aria-label="Choose a database connection"
-        className="max-w-44 truncate rounded-lg border border-line-strong bg-white px-2.5 py-1.5 font-mono text-xs text-ink outline-none transition-colors focus:border-brand"
-      >
-        {envConnection && <option value="env">Built-in data</option>}
-        {connections.map((c) => (
-          <option key={c.id} value={c.id}>
-            {c.name}
-          </option>
-        ))}
-      </select>
+    connections !== null && allSources.length > 0 ? (
+      <div className="flex items-center gap-2">
+        <select
+          value={selected ?? ''}
+          onChange={(e) => setSelected(e.target.value)}
+          aria-label="Choose the primary database connection"
+          className="max-w-44 truncate rounded-lg border border-line-strong bg-white px-2.5 py-1.5 font-mono text-xs text-ink outline-none transition-colors focus:border-brand"
+        >
+          {allSources.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+        {extraCandidates.length > 0 && (
+          <details className="relative">
+            <summary
+              className="cursor-pointer select-none list-none rounded-lg border border-line-strong bg-white px-2.5 py-1.5 font-mono text-xs text-ink transition-colors hover:border-brand [&::-webkit-details-marker]:hidden"
+              title="Compare with other databases on the same dashboard"
+            >
+              {extras.length > 0 ? `also using ${extras.map(sourceName).join(', ')}` : '+ compare'}
+            </summary>
+            <div className="absolute right-0 z-20 mt-1.5 w-56 rounded-xl border border-line bg-white p-2 shadow-lg">
+              <p className="px-2 pb-1.5 pt-0.5 text-[11px] leading-snug text-faint">
+                Also draw panels from (max {MAX_EXTRA_SOURCES}):
+              </p>
+              {extraCandidates.map((c) => (
+                <label
+                  key={c.id}
+                  className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-ink hover:bg-panel-2"
+                >
+                  <input
+                    type="checkbox"
+                    checked={extras.includes(c.id)}
+                    disabled={!extras.includes(c.id) && extras.length >= MAX_EXTRA_SOURCES}
+                    onChange={() => toggleExtra(c.id)}
+                  />
+                  <span className="truncate">{c.name}</span>
+                </label>
+              ))}
+            </div>
+          </details>
+        )}
+      </div>
     ) : undefined;
+
+  // Per-panel source badges, only when the dashboard actually mixes sources.
+  const panelSourceLabels = (() => {
+    if (!spec) return undefined;
+    const effective = (panelConnectionId: string | null) => panelConnectionId ?? selected ?? 'env';
+    const distinct = new Set(spec.panels.map((p) => effective(p.connectionId)));
+    if (distinct.size < 2) return undefined;
+    return Object.fromEntries(spec.panels.map((p) => [p.id, sourceName(effective(p.connectionId))]));
+  })();
 
   return (
     <div className="min-h-screen">
@@ -287,6 +366,8 @@ export default function AppPage() {
               onStartOver={reset}
               onSave={onSave}
               saveStatus={saveStatus}
+              panelSourceLabels={panelSourceLabels}
+              onNarrowPanel={narrowPanel}
             />
           </div>
         </div>

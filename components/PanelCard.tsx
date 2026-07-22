@@ -5,7 +5,16 @@ import { ChartRenderer } from './charts/ChartRenderer';
 import { PanelError } from './PanelError';
 import { downloadText, slugify, toCsv } from '@/lib/download';
 
-export function PanelCard({ panel, state, debug }: { panel: PanelWithId; state: PanelState; debug: boolean }) {
+export function PanelCard({
+  panel, state, debug, sourceLabel, onNarrow,
+}: {
+  panel: PanelWithId;
+  state: PanelState;
+  debug: boolean;
+  /** Connection name badge — set only when the dashboard mixes sources. */
+  sourceLabel?: string;
+  onNarrow?: () => void;
+}) {
   const downloadCsv = () => {
     if (state.status !== 'ready' || !state.columns || !state.rows) return;
     downloadText(`${slugify(panel.title)}.csv`, 'text/csv;charset=utf-8', toCsv(state.columns, state.rows));
@@ -17,6 +26,11 @@ export function PanelCard({ panel, state, debug }: { panel: PanelWithId; state: 
         <div>
           <h2 className="text-sm font-semibold text-ink">{panel.title}</h2>
           {panel.description && <p className="mt-0.5 text-xs leading-relaxed text-muted">{panel.description}</p>}
+          {sourceLabel && (
+            <span className="mt-1.5 inline-block rounded-md border border-line bg-panel-2 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[.08em] text-muted-2">
+              {sourceLabel}
+            </span>
+          )}
         </div>
         {state.status === 'ready' && (
           <button
@@ -55,7 +69,7 @@ export function PanelCard({ panel, state, debug }: { panel: PanelWithId; state: 
         <ChartRenderer panel={panel} columns={state.columns!} rows={state.rows!} truncated={!!state.truncated} />
       )}
 
-      {state.status === 'failed' && <PanelError />}
+      {state.status === 'failed' && <PanelError code={state.error?.code} onNarrow={onNarrow} />}
 
       {debug && (
         <details className="mt-3 rounded-lg border border-line bg-panel-2 p-2 text-xs">

@@ -1,7 +1,7 @@
 // Run: npx tsx scripts/test-sqlguard.ts
 // Covers the AST guard (primary) and pins the legacy keyword guard's
 // behavior (fallback path when the WASM parser cannot load).
-import { checkSql, checkSqlKeyword, type SqlCatalog } from "../lib/sqlGuard";
+import { checkSql, checkSqlKeyword, wrapForExecution, type SqlCatalog } from "../lib/sqlGuard";
 
 const CATALOG: SqlCatalog = {
   tables: {
@@ -156,6 +156,42 @@ const cases: Case[] = [
     expectReason: "forbidden function: query_to_xml",
   },
   {
+    name: "database_to_xml catalog dump",
+    input: "SELECT database_to_xml(true, true, '')",
+    expectOk: false,
+    expectReason: "forbidden function: database_to_xml",
+  },
+  {
+    name: "lo_import file read",
+    input: "SELECT lo_import('/etc/passwd')",
+    expectOk: false,
+    expectReason: "forbidden function: lo_import",
+  },
+  {
+    name: "lo_export file write",
+    input: "SELECT lo_export(1234, '/tmp/out')",
+    expectOk: false,
+    expectReason: "forbidden function: lo_export",
+  },
+  {
+    name: "set_config settings change",
+    input: "SELECT set_config('statement_timeout', '0', false)",
+    expectOk: false,
+    expectReason: "forbidden function: set_config",
+  },
+  {
+    name: "pg_terminate_backend signal",
+    input: "SELECT pg_terminate_backend(12345)",
+    expectOk: false,
+    expectReason: "forbidden function: pg_terminate_backend",
+  },
+  {
+    name: "FOR SHARE locking",
+    input: "SELECT order_id FROM orders FOR SHARE",
+    expectOk: false,
+    expectReason: "row locking",
+  },
+  {
     name: "not valid SQL",
     input: "SELECTT 1",
     expectOk: false,
@@ -215,6 +251,29 @@ const cases: Case[] = [
     expectOk: true,
     catalog: CATALOG,
   },
+  // ---- cost guard (A.3): EXPLAIN is issued only by our own code — a model
+  // emitting it must be rejected as a distinct statement type ----
+  {
+    name: "EXPLAIN rejected",
+    input: "EXPLAIN SELECT amount FROM orders",
+    expectOk: false,
+    expectReason: "only SELECT queries are allowed",
+  },
+  {
+    name: "EXPLAIN ANALYZE rejected",
+    input: "EXPLAIN (ANALYZE) SELECT amount FROM orders",
+    expectOk: false,
+    expectReason: "only SELECT queries are allowed",
+  },
+  // ---- multi-source dashboards (Phase B): SQL bound against source A's
+  // catalog must not reach tables that only exist in source B ----
+  {
+    name: "cross-source: table from another source rejected as unknown",
+    input: "SELECT s.signup_date FROM signups s JOIN orders o ON o.order_id = s.id",
+    expectOk: false,
+    expectReason: 'unknown table: "signups"',
+    catalog: CATALOG, // CATALOG is source A; signups lives only in source B
+  },
 ];
 
 async function main() {
@@ -240,6 +299,15 @@ async function main() {
   } else {
     failures++;
     console.error("FAIL sanitizedSql:", JSON.stringify(c2));
+  }
+
+  // Row-cap wrap: default and per-connection values fetch cap+1 rows so the
+  // executor can distinguish "exactly cap" from "truncated".
+  if (wrapForExecution("SELECT 1").includes("LIMIT 5001") && wrapForExecution("SELECT 1", 200).includes("LIMIT 201")) {
+    console.log("PASS wrapForExecution applies the row cap");
+  } else {
+    failures++;
+    console.error("FAIL wrapForExecution row cap");
   }
 
   // Legacy fallback guard still behaves as before (spot checks).

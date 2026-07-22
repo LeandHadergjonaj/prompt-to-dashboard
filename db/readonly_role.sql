@@ -10,7 +10,11 @@ SELECT format('ALTER ROLE dashboard_reader LOGIN PASSWORD %L CONNECTION LIMIT 10
 WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dashboard_reader') \gexec
 
 ALTER ROLE dashboard_reader SET default_transaction_read_only = on;
-ALTER ROLE dashboard_reader SET statement_timeout = '20s';
+-- The role default is the CEILING; the app passes the per-connection
+-- statement_timeout (default 20s, configurable 5s-120s) as a connection
+-- parameter, which is the effective, tighter bound. A 20s role default
+-- would silently cap per-connection values above it.
+ALTER ROLE dashboard_reader SET statement_timeout = '120s';
 
 GRANT USAGE ON SCHEMA public TO dashboard_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO dashboard_reader;

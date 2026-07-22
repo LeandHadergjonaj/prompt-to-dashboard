@@ -95,13 +95,15 @@ export function deleteConnection(userId: string, id: string): boolean {
   const tx = store.transaction(() => {
     store.prepare("DELETE FROM examples WHERE user_id = ? AND connection_id = ?").run(userId, id);
     store.prepare("DELETE FROM dashboards WHERE user_id = ? AND connection_id = ?").run(userId, id);
+    store.prepare("DELETE FROM connection_settings WHERE connection_id = ?").run(id);
+    store.prepare("DELETE FROM panel_runs WHERE connection_id = ?").run(id);
     store.prepare("DELETE FROM connections WHERE id = ? AND user_id = ?").run(id, userId);
   });
   tx();
-  const pool = pools.get(id);
-  if (pool) {
+  const entry = pools.get(id);
+  if (entry) {
     pools.delete(id);
-    pool.end().catch(() => {});
+    entry.pool.end().catch(() => {});
   }
   return true;
 }
@@ -143,7 +145,11 @@ async function ensureReaderRole(admin: Client, password: string): Promise<void> 
   const head = rows.length === 0 ? "CREATE" : "ALTER";
   await admin.query(`${head} ROLE ${READER_ROLE} LOGIN PASSWORD '${password}' CONNECTION LIMIT 10`);
   await admin.query(`ALTER ROLE ${READER_ROLE} SET default_transaction_read_only = on`);
-  await admin.query(`ALTER ROLE ${READER_ROLE} SET statement_timeout = '20s'`);
+  // The role default is the CEILING (the settings schema's max); the
+  // per-connection statement_timeout connection parameter is the effective,
+  // tighter bound. If the role default were 20s, per-connection values above
+  // it would silently not work.
+  await admin.query(`ALTER ROLE ${READER_ROLE} SET statement_timeout = '120s'`);
   await admin.query(`GRANT USAGE ON SCHEMA public TO ${READER_ROLE}`);
   await admin.query(`GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${READER_ROLE}`);
   await admin.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${READER_ROLE}`);
@@ -169,13 +175,16 @@ async function verifyReaderDsn(readerDsn: string): Promise<void> {
   try {
     await client.query("SELECT 1");
     // Positive proof the role cannot write: creating even a TEMP table must
-    // fail inside its read-only default transaction.
+    // fail inside its read-only default transaction — and specifically with
+    // "cannot execute ... in a read-only transaction" (SQLSTATE 25006). Any
+    // other failure is inconclusive, not proof, so it does not pass.
     let writeBlocked = false;
     try {
       await client.query("CREATE TEMP TABLE _ptd_write_probe (x int)");
       await client.query("DROP TABLE _ptd_write_probe");
-    } catch {
-      writeBlocked = true;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      writeBlocked = code === "25006";
     }
     if (!writeBlocked) {
       throw new ConnectionError(
@@ -217,18 +226,12 @@ export async function onboardConnection(params: {
     );
   }
 
+  // Introspect before touching the reader role: a database we can't read
+  // (or one with nothing in it) must fail onboarding WITHOUT rotating the
+  // password of a dashboard_reader role an earlier connection may be using.
   let introspection;
   const readerPassword = crypto.randomBytes(24).toString("base64url");
   try {
-    try {
-      await ensureReaderRole(admin, readerPassword);
-    } catch (err) {
-      throw new ConnectionError(
-        `role setup failed: ${err instanceof Error ? err.message : String(err)}`,
-        "We connected, but couldn't create the read-only role. The user in the connection string needs permission to create roles and grant access (an admin/owner user).",
-        502
-      );
-    }
     try {
       introspection = await introspectDatabase(admin);
     } catch (err) {
@@ -238,15 +241,23 @@ export async function onboardConnection(params: {
         502
       );
     }
+    if (introspection.stats.tableCount === 0) {
+      throw new ConnectionError(
+        "no tables found",
+        "We connected, but found no tables in the public schema — there's nothing to build dashboards from yet."
+      );
+    }
+    try {
+      await ensureReaderRole(admin, readerPassword);
+    } catch (err) {
+      throw new ConnectionError(
+        `role setup failed: ${err instanceof Error ? err.message : String(err)}`,
+        "We connected, but couldn't create the read-only role. The user in the connection string needs permission to create roles and grant access (an admin/owner user).",
+        502
+      );
+    }
   } finally {
     await admin.end().catch(() => {});
-  }
-
-  if (introspection.stats.tableCount === 0) {
-    throw new ConnectionError(
-      "no tables found",
-      "We connected, but found no tables in the public schema — there's nothing to build dashboards from yet."
-    );
   }
 
   const readerUrl = new URL(url.toString());
@@ -302,6 +313,47 @@ export function fallbackSummary(stats: IntrospectStats): string {
 }
 
 // ---------------------------------------------------------------------------
+// Per-connection settings (statement timeout + result-row cap)
+// ---------------------------------------------------------------------------
+
+export interface ConnectionSettings {
+  statementTimeoutMs: number;
+  maxResultRows: number;
+}
+
+export const DEFAULT_CONNECTION_SETTINGS: ConnectionSettings = {
+  statementTimeoutMs: 20_000,
+  maxResultRows: 5_000,
+};
+
+export function getConnectionSettings(connectionKey: string): ConnectionSettings {
+  const row = getAppStore()
+    .prepare("SELECT statement_timeout_ms, max_result_rows FROM connection_settings WHERE connection_id = ?")
+    .get(connectionKey) as { statement_timeout_ms: number; max_result_rows: number } | undefined;
+  if (!row) return { ...DEFAULT_CONNECTION_SETTINGS };
+  return { statementTimeoutMs: row.statement_timeout_ms, maxResultRows: row.max_result_rows };
+}
+
+/** Range validation happens in the request schema; the table CHECKs are the backstop. */
+export function updateConnectionSettings(
+  connectionKey: string,
+  patch: Partial<ConnectionSettings>
+): ConnectionSettings {
+  const merged = { ...getConnectionSettings(connectionKey), ...patch };
+  getAppStore()
+    .prepare(
+      `INSERT INTO connection_settings (connection_id, statement_timeout_ms, max_result_rows)
+       VALUES (?, ?, ?)
+       ON CONFLICT(connection_id) DO UPDATE SET
+         statement_timeout_ms = excluded.statement_timeout_ms,
+         max_result_rows = excluded.max_result_rows,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+    )
+    .run(connectionKey, merged.statementTimeoutMs, merged.maxResultRows);
+  return merged;
+}
+
+// ---------------------------------------------------------------------------
 // Execution contexts (pools + schema context + binding catalog)
 // ---------------------------------------------------------------------------
 
@@ -311,26 +363,51 @@ export interface ExecutionContext {
   pool: Pool;
   schemaContext: string;
   catalog: SqlCatalog | null;
+  settings: ConnectionSettings;
 }
 
-const pools = new Map<string, Pool>();
+// Pools are created on demand and evicted after sitting unused — clients
+// within a pool are already idle-pruned (lib/db.ts), but without whole-pool
+// eviction a user touching many connections would accumulate one live pool
+// per connection for the process lifetime.
+const POOL_IDLE_EVICT_MS = 15 * 60_000;
+const pools = new Map<string, { pool: Pool; lastUsedAt: number; statementTimeoutMs: number }>();
 
-function getPool(key: string, dsn: string): Pool {
-  let pool = pools.get(key);
-  if (!pool) {
-    pool = createReaderPool(dsn);
-    pools.set(key, pool);
+function getPool(key: string, dsn: string, statementTimeoutMs: number): Pool {
+  const now = Date.now();
+  for (const [k, entry] of pools) {
+    if (k !== key && now - entry.lastUsedAt > POOL_IDLE_EVICT_MS) {
+      pools.delete(k);
+      entry.pool.end().catch(() => {});
+    }
   }
-  return pool;
+  let entry = pools.get(key);
+  // statement_timeout is a pool-creation parameter, so a settings change
+  // must retire the old pool and build a fresh one.
+  if (entry && entry.statementTimeoutMs !== statementTimeoutMs) {
+    pools.delete(key);
+    entry.pool.end().catch(() => {});
+    entry = undefined;
+  }
+  if (!entry) {
+    entry = { pool: createReaderPool(dsn, statementTimeoutMs), lastUsedAt: now, statementTimeoutMs };
+    pools.set(key, entry);
+  }
+  entry.lastUsedAt = now;
+  return entry.pool;
 }
 
 // Legacy connection's binding catalog, introspected lazily from pg_catalog
-// (db/schema-context.md is hand-generated and not machine-parsed).
+// (db/schema-context.md is hand-generated and not machine-parsed). A failed
+// introspection degrades to no binding for a cooldown period, then retries —
+// a transient outage must not disable binding for the process lifetime.
+const ENV_CATALOG_RETRY_MS = 60_000;
 let envCatalog: SqlCatalog | null = null;
-let envCatalogFailed = false;
+let envCatalogFailedAt = 0;
 
 async function getEnvCatalog(pool: Pool): Promise<SqlCatalog | null> {
-  if (envCatalog || envCatalogFailed) return envCatalog;
+  if (envCatalog) return envCatalog;
+  if (envCatalogFailedAt && Date.now() - envCatalogFailedAt < ENV_CATALOG_RETRY_MS) return null;
   try {
     const { rows } = await pool.query(
       `SELECT c.relname AS rel, COALESCE(a.attname, '') AS col
@@ -344,8 +421,9 @@ async function getEnvCatalog(pool: Pool): Promise<SqlCatalog | null> {
       (catalog.tables[r.rel] ??= []).push(r.col);
     }
     envCatalog = catalog;
+    envCatalogFailedAt = 0;
   } catch {
-    envCatalogFailed = true; // degrade to no binding rather than blocking queries
+    envCatalogFailedAt = Date.now(); // degrade to no binding rather than blocking queries
   }
   return envCatalog;
 }
@@ -362,12 +440,14 @@ export async function getExecutionContext(
         400
       );
     }
-    const pool = getPool(ENV_CONNECTION_ID, env.DATABASE_URL_READONLY);
+    const settings = getConnectionSettings(ENV_CONNECTION_ID);
+    const pool = getPool(ENV_CONNECTION_ID, env.DATABASE_URL_READONLY, settings.statementTimeoutMs);
     return {
       connectionKey: ENV_CONNECTION_ID,
       pool,
       schemaContext: getSchemaContext(),
       catalog: await getEnvCatalog(pool),
+      settings,
     };
   }
 
@@ -382,11 +462,13 @@ export async function getExecutionContext(
   getAppStore()
     .prepare("UPDATE connections SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
     .run(row.id);
+  const settings = getConnectionSettings(row.id);
   return {
     connectionKey: row.id,
-    pool: getPool(row.id, decryptString(row.dsn_ciphertext)),
+    pool: getPool(row.id, decryptString(row.dsn_ciphertext), settings.statementTimeoutMs),
     schemaContext: row.schema_context,
     catalog: JSON.parse(row.catalog_json) as SqlCatalog,
+    settings,
   };
 }
 

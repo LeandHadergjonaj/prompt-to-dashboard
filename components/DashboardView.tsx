@@ -9,6 +9,7 @@ export type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
 
 export function DashboardView({
   spec, question, panels, debug, onStartOver, onSave, saveStatus = 'idle',
+  panelSourceLabels, onNarrowPanel,
 }: {
   spec: DashboardSpecWithIds;
   question: string;
@@ -17,6 +18,9 @@ export function DashboardView({
   onStartOver: () => void;
   onSave?: () => void;
   saveStatus?: SaveStatus;
+  /** Panel id -> connection name; provided only when the dashboard mixes sources. */
+  panelSourceLabels?: Record<string, string>;
+  onNarrowPanel?: (panel: DashboardSpecWithIds['panels'][number]) => void;
 }) {
   // PNG capture target: header + grid, minus anything marked data-no-export.
   const captureRef = useRef<HTMLDivElement>(null);
@@ -68,7 +72,13 @@ export function DashboardView({
             panel.chartType === 'table' ? 'md:col-span-4' : panel.chartType === 'stat' ? 'md:col-span-1' : 'md:col-span-2';
           return (
             <div key={panel.id} className={spanClass}>
-              <PanelCard panel={panel} state={panels[panel.id]} debug={debug} />
+              <PanelCard
+                panel={panel}
+                state={panels[panel.id]}
+                debug={debug}
+                sourceLabel={panelSourceLabels?.[panel.id]}
+                onNarrow={onNarrowPanel ? () => onNarrowPanel(panel) : undefined}
+              />
             </div>
           );
         })}

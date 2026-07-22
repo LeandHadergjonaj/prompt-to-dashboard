@@ -3,9 +3,9 @@ import { z } from "zod";
 import { zodTextFormat } from "openai/helpers/zod";
 import { env } from "./env";
 import {
-  DashboardSpecSchema,
+  GeneratedDashboardSchema,
   RepairSqlSchema,
-  type DashboardSpec,
+  type GeneratedDashboard,
   type HistoryTurn,
   type PanelSpec,
 } from "./types";
@@ -52,14 +52,23 @@ async function callWithFallback<T>(fn: (model: string) => Promise<T>): Promise<T
 export interface FewShotExample {
   question: string;
   sql: string;
+  /** Which source the pair belongs to; shown only on multi-source dashboards. */
+  sourceName?: string;
+}
+
+/** One database a dashboard may draw from. `id` is what panel sourceId must equal. */
+export interface DashboardSource {
+  id: string;   // 'env' or a connection id
+  name: string; // human-readable label
+  schemaContext: string;
 }
 
 export interface GenerateDashboardParams {
   question: string;
   currentDate: string;   // 'YYYY-MM-DD'
-  schemaContext: string; // the connection's introspected schema context
+  sources: DashboardSource[]; // primary FIRST; 1-3 sources
   history: HistoryTurn[]; // prior turns, oldest first; [] for a first request
-  examples?: FewShotExample[]; // retrieved accepted pairs for this database
+  examples?: FewShotExample[]; // retrieved accepted pairs for these databases
 }
 
 // Each prior turn becomes a real user/assistant message pair, so the model
@@ -77,39 +86,54 @@ function historyToInput(history: HistoryTurn[]) {
   ]);
 }
 
-// Retrieved few-shot examples ride in a SECOND system message, after the
-// static prompt, so the prompt-cache prefix (static system prompt + schema)
-// stays byte-stable across questions.
+// Retrieved few-shot examples ride in a LATER system message, after the
+// static prompt and schema messages, so the prompt-cache prefix (static
+// system prompt + per-source schemas) stays byte-stable across questions.
 function examplesToInput(examples: FewShotExample[] | undefined) {
   if (!examples || examples.length === 0) return [];
   const rendered = examples
-    .map((e) => `Q: ${e.question}\nSQL:\n${e.sql}`)
+    .map((e) => `${e.sourceName ? `Source: ${e.sourceName}\n` : ""}Q: ${e.question}\nSQL:\n${e.sql}`)
     .join("\n\n");
   return [
     {
       role: "system" as const,
       content:
         `## Proven examples from this database\n` +
-        `The following question -> SQL pairs were previously generated for THIS same database and accepted by the user. ` +
+        `The following question -> SQL pairs were previously generated for THIS same database (each labeled with its source when several are connected) and accepted by the user. ` +
         `They are known to run correctly. When the new question resembles one of them, imitate its table/column identifiers, join paths, filters, and conventions rather than inventing new ones. ` +
         `Ignore them when they are not relevant.\n\n${rendered}`,
     },
   ];
 }
 
-export async function generateDashboardSpec(params: GenerateDashboardParams): Promise<DashboardSpec> {
-  const systemPrompt = buildDashboardSystemPrompt(params);
+// One system message per source, in request order (primary first). The
+// prompt-cache prefix is stable per ordered combination of sources.
+export function buildSourceMessage(source: DashboardSource): string {
+  return (
+    `## Source "${source.name}" (id: ${source.id})\n\n` +
+    `Panels with sourceId "${source.id}" may ONLY reference the tables and columns below.\n\n` +
+    `<schema>\n${source.schemaContext}\n</schema>`
+  );
+}
+
+function sourcesToInput(sources: DashboardSource[]) {
+  return sources.map((s) => ({ role: "system" as const, content: buildSourceMessage(s) }));
+}
+
+export async function generateDashboardSpec(params: GenerateDashboardParams): Promise<GeneratedDashboard> {
+  const systemPrompt = buildDashboardSystemPrompt({ currentDate: params.currentDate });
   return callWithFallback(async (model) => {
     const response = await client.responses.parse({
       model,
       input: [
         { role: "system", content: systemPrompt },
+        ...sourcesToInput(params.sources),
         ...examplesToInput(params.examples),
         ...historyToInput(params.history),
         { role: "user", content: params.question },
       ],
       reasoning: { effort: "medium" },
-      text: { verbosity: "low", format: zodTextFormat(DashboardSpecSchema, "dashboard_spec") },
+      text: { verbosity: "low", format: zodTextFormat(GeneratedDashboardSchema, "dashboard_spec") },
       max_output_tokens: 4000,
     });
     if (!response.output_parsed) throw new LlmError("model returned no parseable dashboard spec", response);
@@ -123,10 +147,12 @@ export interface RepairSqlParams {
   sql: string;
   errorMessage: string;
   schemaContext: string;
+  /** true when the query timed out — switches to the do-less-work instruction set */
+  timedOut?: boolean;
 }
 
 export async function repairSql(params: RepairSqlParams): Promise<string> {
-  const systemPrompt = buildRepairSystemPrompt(params.schemaContext);
+  const systemPrompt = buildRepairSystemPrompt(params.schemaContext, params.timedOut === true);
   const userPrompt = buildRepairUserPrompt(params);
   return callWithFallback(async (model) => {
     const response = await client.responses.parse({
@@ -192,15 +218,55 @@ export async function generateConnectionSummary(stats: ConnectionSummaryStats): 
   });
 }
 
+// Performance advisor (A.4): turns per-connection run aggregates + schema
+// into 2-4 copy-pasteable DDL suggestions. NEVER executed by the app — the
+// caller renders them for a human admin. Callers must catch failures and use
+// their deterministic fallback.
+export interface AdviceSuggestion {
+  title: string;
+  ddl: string | null; // e.g. CREATE INDEX CONCURRENTLY ...; null for non-DDL advice
+  rationale: string;  // plain-English cost/benefit line
+}
+
+const AdviceSchema = z.object({
+  suggestions: z.array(
+    z.object({ title: z.string(), ddl: z.string().nullable(), rationale: z.string() })
+  ),
+});
+
+export async function generateAdviceSuggestions(params: {
+  aggregates: unknown;
+  schemaContext: string;
+}): Promise<AdviceSuggestion[]> {
+  return callWithFallback(async (model) => {
+    const response = await client.responses.parse({
+      model,
+      input: [
+        {
+          role: "system",
+          content:
+            `You are a PostgreSQL performance advisor for a read-only dashboard tool. You receive (a) aggregated telemetry about the queries the tool ran against one database — durations, timeout rates, the tables involved, recurring SQL shapes — and (b) that database's schema context. ` +
+            `Produce 2-4 concrete suggestions the database ADMIN can run themselves to make the slow/timing-out queries fast. Prefer, in order: a missing index on a filtered/joined column (use CREATE INDEX CONCURRENTLY), a materialized view pre-aggregating a hot rollup (include a REFRESH cadence note in the rationale), and ANALYZE when statistics look stale. ` +
+            `Each suggestion needs a short title, the exact DDL in the ddl field (or null if the advice has no single statement), and a one-sentence plain-English rationale stating the cost and the benefit. ` +
+            `Only reference tables and columns that exist in the schema. The dashboard tool itself NEVER executes DDL — these are for a human admin.\n\n<schema>\n${params.schemaContext}\n</schema>`,
+        },
+        { role: "user", content: JSON.stringify(params.aggregates) },
+      ],
+      reasoning: { effort: "medium" },
+      text: { verbosity: "low", format: zodTextFormat(AdviceSchema, "performance_advice") },
+      max_output_tokens: 1500,
+    });
+    if (!response.output_parsed) throw new LlmError("no parseable advice", response);
+    return response.output_parsed.suggestions.slice(0, 4);
+  });
+}
+
 // Prompt-cache note: schema context + current date live in the SYSTEM message;
 // per-call content (question / failing SQL) in the USER message.
 
-export function buildDashboardSystemPrompt(params: {
-  currentDate: string;
-  schemaContext: string;
-}): string {
-  const { currentDate, schemaContext } = params;
-  return `You are a senior data analyst embedded in a dashboard layer that runs on top of the user's own PostgreSQL database. You know nothing about the database except the schema context provided below. Non-technical users type plain-English questions and you turn each question into a small dashboard specification. You never talk to the user directly — you only produce a single structured JSON object that exactly matches the provided output schema. Do not include any prose, explanation, or markdown outside the JSON.
+export function buildDashboardSystemPrompt(params: { currentDate: string }): string {
+  const { currentDate } = params;
+  return `You are a senior data analyst embedded in a dashboard layer that runs on top of the user's own PostgreSQL databases. You know nothing about the databases except the schema context provided in the source messages that follow. Non-technical users type plain-English questions and you turn each question into a small dashboard specification. You never talk to the user directly — you only produce a single structured JSON object that exactly matches the provided output schema. Do not include any prose, explanation, or markdown outside the JSON.
 
 ## Today's date
 Today's date is ${currentDate} (YYYY-MM-DD). Each date column's actual coverage is listed in the schema context below — check it before applying a date filter, and skip the filter when it would exclude all data. When the user uses a relative time phrase:
@@ -213,12 +279,12 @@ Today's date is ${currentDate} (YYYY-MM-DD). Each date column's actual coverage 
 - If no time period is mentioned, do not add a date filter.
 Always compute relative dates using the literal date '${currentDate}' in the SQL itself (e.g. DATE '${currentDate}' - INTERVAL '1 year') rather than CURRENT_DATE, so results are reproducible.
 
-## Database schema
-You may ONLY reference tables and columns that appear below. If a question cannot be answered exactly with this schema, do the closest reasonable thing with the data available rather than inventing columns or tables.
-
-<schema>
-${schemaContext}
-</schema>
+## Data sources
+One or more sources follow this message, each in its own system message headed \`## Source "<name>" (id: <id>)\` and containing that database's schema. Rules:
+- Each panel queries exactly ONE source. Set the panel's sourceId field to the exact id from that source's header; its SQL must only reference tables from that panel's source. Never mix tables from different sources in one panel.
+- You may ONLY reference tables and columns that appear in the source schemas. If a question cannot be answered exactly with these schemas, do the closest reasonable thing with the data available rather than inventing columns or tables.
+- When several sources could answer, prefer the FIRST listed source (the user's primary). Use another source only when the question names it or its data.
+- To compare data across sources, build separate panels side by side (one per source) — never a single cross-source query.
 
 ## SQL rules (hard requirements)
 1. Every panel's \`sql\` must be a single read-only PostgreSQL statement. It must start with SELECT or WITH. Never use INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE, MERGE, CALL, or COPY, or any statement that writes data or metadata.
@@ -231,6 +297,7 @@ ${schemaContext}
 8. Prefer explicit JOIN ... ON syntax over comma joins, and only join tables on keys the schema context supports (foreign keys, or columns the sampled values show are compatible). Always qualify ambiguous column names with a table alias.
 9. Never use SELECT *; always select explicit columns.
 10. PostgreSQL identifiers are case-sensitive. Always wrap every table and column name in double quotes, matching the EXACT capitalization shown in the schema context (e.g. FROM "Invoice" AS i ... SUM(i."Total")). Unquoted identifiers are silently folded to lower-case, so a table named "Invoice" or a column named "InvoiceDate" will not be found without quotes. This applies to every schema, including all-lowercase ones (quoting a lowercase name is always safe). Snake_case aliases you introduce for computed columns (e.g. AS total_revenue) are new lowercase names and do not need quotes.
+11. Queries run under a strict time budget. On tables whose row count is marked in the millions (e.g. "~40M"), prefer aggregates and date filters and avoid selecting raw rows; lean on any views or materialized views listed in the schema, and on relations marked "federated (remote)" aggregate before joining.
 
 ## Choosing chart types
 - "stat": a single headline number (a total, an average, a count) with no breakdown — the SQL must return exactly one row. Use valueField for the number, and comparison for a one-clause plain-English comparison (e.g. "vs. 12,400 the prior month") only if the SQL actually computes that comparison value; otherwise null.
@@ -266,8 +333,14 @@ For mode "new", design the dashboard from scratch and ignore the prior panels.
 Return only the JSON object described by the response schema. Do not wrap it in markdown code fences. Do not add commentary before or after it.`;
 }
 
-export function buildRepairSystemPrompt(schemaContext: string): string {
-  return `You are a PostgreSQL expert fixing a single broken query inside a generated dashboard panel. You will be given the original user question, the panel's title and chart type, the SQL that failed, and the exact database error message. Return a corrected single SELECT/WITH statement that fixes the error while still answering the original intent of the panel as closely as possible.
+export function buildRepairSystemPrompt(schemaContext: string, timedOut = false): string {
+  const preamble = timedOut
+    ? `You are a PostgreSQL expert rewriting a dashboard panel query that was CANCELLED FOR EXCEEDING ITS TIME BUDGET. The query was semantically correct but did too much work. Do not merely reformat it — rewrite it to do less work: pre-aggregate before joining, add or tighten a date filter to the most recent few months, reduce the number of joins, aggregate at a coarser granularity, or use an existing view or materialized view from the schema instead of scanning raw tables. Resubmitting an equivalent query will time out again.`
+    : `You are a PostgreSQL expert fixing a single broken query inside a generated dashboard panel. You will be given the original user question, the panel's title and chart type, the SQL that failed, and the exact database error message. Return a corrected single SELECT/WITH statement that fixes the error while still answering the original intent of the panel as closely as possible.`;
+  const intentRule = timedOut
+    ? `3. Keep the panel's subject and breakdown recognizable, but you SHOULD narrow the time range (e.g. to the most recent 90 days or 12 months) or coarsen the aggregation to fit the time budget.`
+    : `3. Preserve the original panel's intent (same grouping, breakdown, and time range) unless the error means that intent is impossible with this schema, in which case make the smallest reasonable change.`;
+  return `${preamble}
 
 ## Database schema
 <schema>
@@ -277,7 +350,7 @@ ${schemaContext}
 ## Rules
 1. The corrected SQL must be a single read-only statement starting with SELECT or WITH. No trailing semicolon. Never use INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE, MERGE, CALL, or COPY.
 2. Only reference tables and columns that appear in the schema above.
-3. Preserve the original panel's intent (same grouping, breakdown, and time range) unless the error means that intent is impossible with this schema, in which case make the smallest reasonable change.
+${intentRule}
 4. Always alias aggregate or computed columns with clear snake_case names.
 5. If the error indicates a timeout, add or tighten a LIMIT, narrow the aggregation, or add a missing date-range filter rather than simply resubmitting the same query unchanged.
 6. PostgreSQL identifiers are case-sensitive. Wrap every table and column name in double quotes, matching the EXACT capitalization shown in the schema context (e.g. FROM "Invoice" AS i ... SUM(i."Total")). An error like \`relation "invoice" does not exist\` or \`column ... does not exist\` almost always means an identifier was left unquoted and got folded to lower-case — fix it by quoting the identifier with its real capitalization.

@@ -1,5 +1,5 @@
 import { Pool, types } from "pg";
-import { wrapForExecution } from "./sqlGuard";
+import { DEFAULT_MAX_RESULT_ROWS, wrapForExecution } from "./sqlGuard";
 import type { ColumnMeta } from "./types";
 
 // numeric + int8 -> numbers (safe: values < 2^53); dates/timestamps -> ISO strings
@@ -14,13 +14,24 @@ types.setTypeParser(1184, (v: string) => {
 
 // TLS comes from the connection string's sslmode parameter
 // (disable | require | no-verify | verify-full).
-export function createReaderPool(connectionString: string): Pool {
+//
+// statementTimeoutMs is the per-connection setting (connection_settings) and
+// is the EFFECTIVE bound: newly onboarded roles carry the 120s ceiling as
+// their ALTER ROLE default, so this connection parameter is what actually
+// governs. Connections onboarded before the ceiling change still have the
+// 20s role default, which silently caps values above it until re-onboarding.
+export const DEFAULT_STATEMENT_TIMEOUT_MS = 20_000;
+
+export function createReaderPool(
+  connectionString: string,
+  statementTimeoutMs: number = DEFAULT_STATEMENT_TIMEOUT_MS
+): Pool {
   return new Pool({
     connectionString,
     max: 3,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
-    statement_timeout: 19_000, // just under the role's 20s backstop
+    statement_timeout: statementTimeoutMs,
   });
 }
 
@@ -41,26 +52,55 @@ export interface PanelQueryResult {
   truncated: boolean;
 }
 
-const WRAP_LIMIT = 5001;
-const DISPLAY_LIMIT = 5000;
-
-export async function executePanelQuery(pool: Pool, sanitizedSql: string): Promise<PanelQueryResult> {
+export async function executePanelQuery(
+  pool: Pool,
+  sanitizedSql: string,
+  maxRows: number = DEFAULT_MAX_RESULT_ROWS
+): Promise<PanelQueryResult> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN TRANSACTION READ ONLY");
-    const result = await client.query({ text: wrapForExecution(sanitizedSql), rowMode: "array" });
+    const result = await client.query({ text: wrapForExecution(sanitizedSql, maxRows), rowMode: "array" });
     await client.query("COMMIT");
 
     const columns: ColumnMeta[] = result.fields.map((f) => ({
       name: f.name,
       type: normalizeColumnType(f.dataTypeID),
     }));
-    const truncated = result.rows.length >= WRAP_LIMIT;
-    const rows = truncated ? result.rows.slice(0, DISPLAY_LIMIT) : result.rows;
+    const truncated = result.rows.length > maxRows;
+    const rows = truncated ? result.rows.slice(0, maxRows) : result.rows;
     return { columns, rows, truncated };
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Pre-flight planner cost (A.3 stage 1, warn-only): EXPLAIN without ANALYZE
+// is read-only, fast, and does not execute the query. Issued only by OUR
+// code on the pooled read-only connection — EXPLAIN arriving from the model
+// stays rejected by the AST guard (ExplainStmt is not a SelectStmt).
+// Best-effort: any failure returns null and the panel runs regardless.
+export async function explainQueryCost(
+  pool: Pool,
+  sanitizedSql: string,
+  maxRows: number = DEFAULT_MAX_RESULT_ROWS
+): Promise<number | null> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN TRANSACTION READ ONLY");
+    const result = await client.query(
+      `EXPLAIN (FORMAT JSON) ${wrapForExecution(sanitizedSql, maxRows)}`
+    );
+    await client.query("COMMIT");
+    const plan = (result.rows[0]?.["QUERY PLAN"] as Array<{ Plan?: { "Total Cost"?: number } }>)?.[0];
+    const cost = plan?.Plan?.["Total Cost"];
+    return typeof cost === "number" ? cost : null;
+  } catch {
+    await client.query("ROLLBACK").catch(() => {});
+    return null;
   } finally {
     client.release();
   }
